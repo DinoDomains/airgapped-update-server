@@ -18,6 +18,7 @@ use tower::Service;
 pub struct ClientIdentity {
     pub cn: Option<String>,
     pub authenticated: bool,
+    pub peer: Option<String>,
 }
 
 #[async_trait::async_trait]
@@ -68,24 +69,26 @@ pub async fn serve(
     let listener = TcpListener::bind(addr).await?;
     tracing::info!("airgap server listening on {addr} (mTLS)");
     loop {
-        let (stream, _peer) = listener.accept().await?;
+        let (stream, peer) = listener.accept().await?;
+        let peer_ip = peer.ip().to_string();
         let tls = tls.clone();
         let router = router.clone();
         tokio::spawn(async move {
             let Ok(tls_stream) = tls.accept(stream).await else {
                 return;
             };
-            let identity = tls_stream
-                .get_ref()
-                .1
-                .peer_certificates()
-                .and_then(|certs| certs.first())
-                .and_then(|c| cert_cn(c))
-                .map(|cn| ClientIdentity {
-                    cn: Some(cn),
-                    authenticated: true,
-                })
-                .unwrap_or_default();
+            let mut identity = ClientIdentity {
+                peer: Some(peer_ip),
+                ..Default::default()
+            };
+            if let Some(certs) = tls_stream.get_ref().1.peer_certificates() {
+                if let Some(c) = certs.first() {
+                    if let Some(cn) = cert_cn(c) {
+                        identity.cn = Some(cn);
+                        identity.authenticated = true;
+                    }
+                }
+            }
 
             let svc = WithClientIdentity { router, identity };
             let io = hyper_util::rt::TokioIo::new(tls_stream);

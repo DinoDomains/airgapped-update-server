@@ -19,6 +19,12 @@ rustls-pemfile.workspace = true
 tokio-rustls.workspace = true
 axum.workspace = true
 x509-parser.workspace = true
+flate2.workspace = true
+sha2.workspace = true
+hex.workspace = true
+tokio-util.workspace = true
+reqwest.workspace = true
+quick-xml = "0.36"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 tower = "0.5"

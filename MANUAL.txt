@@ -42,13 +42,16 @@ RUN THE SERVER (on the machine that will be the update server)
 --------------------------------------------------------------
   AIRGAP_STORE_DIR=/var/lib/airgap-server \
   AIRGAP_LISTEN=0.0.0.0:8443 \
+  AIRGAP_HTTP_LISTEN=0.0.0.0:8080 \
   ./target/x86_64-unknown-linux-musl/release/airgap-server
 
   Environment variables:
     AIRGAP_STORE_DIR    state directory (agents.json, reports.json,
-                        catalog.json, tokens.json, ca/, certs/)
+                        catalog.json, tokens.json, updates.json,
+                        ca/, certs/)
                         DEFAULT: "data" (relative to CWD - always set this!)
-    AIRGAP_LISTEN       listen address           DEFAULT: 0.0.0.0:8443
+    AIRGAP_LISTEN       mTLS API address        DEFAULT: 0.0.0.0:8443
+    AIRGAP_HTTP_LISTEN  dashboard/HTTP address  DEFAULT: 0.0.0.0:8080
     AIRGAP_ENROLL_TOKEN enrollment token seed    DEFAULT: airgap-bootstrap
 
   On first boot the server generates its own CA (ca.pem + ca-key.pem),
@@ -56,13 +59,27 @@ RUN THE SERVER (on the machine that will be the update server)
   directory! If you restart without AIRGAP_STORE_DIR a fresh CA is created
   and every already-provisioned agent becomes invalid.
 
-  API endpoints (all JSON, HTTPS):
+  API endpoints (all JSON, HTTPS on :8443):
     POST /enroll     token + hostname  -> agent_id, client cert, key, CA
     POST /register   agent_id + inventory
     POST /inventory  agent_id + inventory
     POST /updates    agent_id          -> pending updates list
     POST /report     agent_id + update_id + status
     GET  /health     -> "ok"
+
+  DASHBOARD (plain HTTP on :8080 - point a browser at the server's IP):
+    GET  /                        web dashboard
+    GET  /api/devices             all registered devices
+    GET  /api/devices/<id>/packages   per-device installed vs latest
+    POST /api/refresh             sync upstream apt/dnf metadata (catalog)
+    POST /api/update              {"agent_id":..,"package":..} -> approval
+    GET  /api/updates             pending update approvals
+
+  Open the dashboard at:  http://<server-ip>:8080
+  It lists every device, and for each device shows its installed software
+  with the latest upstream version alongside. "Refresh package catalog"
+  fetches latest versions from Ubuntu (noble) and Rocky 8 metadata.
+  "Approve & update" asks for confirmation and records an approval.
 
 PROVISION AN AGENT (isolated machine)
 -------------------------------------
@@ -85,13 +102,22 @@ PROVISION AN AGENT (isolated machine)
     AIRGAP_STATE_DIR state directory   DEFAULT: /var/lib/airgap-agent
     AIRGAP_ENROLL_TOKEN                only needed on first enroll
 
-VERIFY
-------
-  On the server, inspect the state:
-    /var/lib/airgap-server/agents.json   (registered agents + inventories)
-    /var/lib/airgap-server/reports.json  (install reports)
-  Or on the agent, run the agent again - it should log
-  "registered as <agent-id>" and "server offered 0 update(s)".
+VERIFY / MANUAL TEST
+--------------------
+  1. Server health:
+       curl -sk https://<server-ip>:8443/health      # -> "ok"
+  2. Run an agent once per VM (enrolls + registers + reports):
+       ssh root@<agent> 'AIRGAP_STATE_DIR=/var/lib/airgap-agent \
+         AIRGAP_SERVER=https://<server-ip>:8443 /usr/local/bin/airgap-agent'
+       It should log "registered as <agent-id>" and "server offered 0 update(s)".
+  3. Check registered agents on the server:
+       /var/lib/airgap-server/agents.json
+  4. Open the dashboard:   http://<server-ip>:8080
+       - devices are listed with IP, OS, arch, kernel, status
+       - click a device to see its software with installed vs latest version
+       - "Refresh package catalog" fetches latest versions from upstream
+       - "Approve & update" asks for confirmation and records the approval
+         (shown under "Pending approvals")
 
 NETWORKING NOTES
 ----------------
@@ -106,7 +132,9 @@ NETWORKING NOTES
 KNOWN LIMITATIONS (BETA)
 ------------------------
   - JSON file store (no database yet).
-  - /updates always returns an empty list (package mirroring + approval
-    rings are the next milestone).
+  - "Approve & update" records an approval; actual package install on the
+    agent is the next milestone (agents currently only report versions).
+  - Version comparison is best-effort (distro version strings are complex);
+    a few packages may show a stale "latest".
   - Enrollment token is a single shared secret.
   - SELinux left Permissive in the lab; needs a hardening pass for prod.

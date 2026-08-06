@@ -37,6 +37,7 @@ fn require_auth(identity: &ClientIdentity) -> Result<String, Response> {
 #[axum::debug_handler]
 pub async fn enroll(
     State(st): State<ApiState>,
+    identity: ClientIdentity,
     Json(req): Json<EnrollRequest>,
 ) -> Response {
     if !st.store.check_token(&req.token).await {
@@ -59,6 +60,7 @@ pub async fn enroll(
                 inventory: None,
                 last_seen: None,
                 status: "enrolled".to_string(),
+                ip: identity.peer,
             };
             st.store.register_agent(record).await;
             Json(resp).into_response()
@@ -88,6 +90,7 @@ pub async fn register(
         inventory: Some(req.inventory),
         last_seen: Some(now_ts()),
         status: "registered".to_string(),
+        ip: identity.peer,
     };
     st.store.register_agent(record).await;
     tracing::info!("agent registered: {cn}");
@@ -110,7 +113,10 @@ pub async fn inventory(
     if cn != req.agent_id {
         return err(StatusCode::FORBIDDEN, "agent_id does not match certificate");
     }
-    let ok = st.store.update_inventory(&cn, req.inventory).await;
+    let ok = st
+        .store
+        .update_inventory(&cn, req.inventory, identity.peer)
+        .await;
     if !ok {
         return err(StatusCode::NOT_FOUND, "agent not registered");
     }

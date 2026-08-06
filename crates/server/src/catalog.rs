@@ -1,0 +1,424 @@
+use std::collections::HashMap;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
+use airgap_proto::DistroFamily;
+use flate2::read::GzDecoder;
+use serde::{Deserialize, Serialize};
+use tokio::sync::{Mutex, RwLock};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LatestPackage {
+    pub name: String,
+    pub version: String,
+    pub family: String,
+    pub repo: String,
+    pub arch: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CatalogData {
+    pub packages: HashMap<String, LatestPackage>,
+}
+
+pub struct Catalog {
+    dir: PathBuf,
+    data: RwLock<CatalogData>,
+    syncing: Mutex<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SyncReport {
+    pub packages: usize,
+    pub apt: usize,
+    pub dnf: usize,
+}
+
+const APT_HOSTS: &[(&str, &[&str])] = &[
+    ("http://archive.ubuntu.com/ubuntu", &["noble", "noble-updates"]),
+    ("http://security.ubuntu.com/ubuntu", &["noble-security"]),
+];
+const APT_COMPONENTS: &[&str] = &["main", "universe"];
+const APT_ARCH: &str = "amd64";
+
+const DNF_REPOS: &[(&str, &str)] = &[
+    ("baseos", "http://mirror.rackspace.com/rocky/8/BaseOS/x86_64/os"),
+    ("appstream", "http://mirror.rackspace.com/rocky/8/AppStream/x86_64/os"),
+];
+
+/// Builds a client that resolves every upstream host to IPv4 only. Some
+/// mirrors (dl.rockylinux.org) advertise AAAA records but the air-gapped
+/// server has no IPv6 route; without pinning, reqwest can stall on IPv6.
+pub fn build_client() -> reqwest::Client {
+    use std::net::ToSocketAddrs;
+    let mut builder = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(90));
+    for host in upstream_hosts() {
+        if let Ok(addr) = format!("{host}:80").to_socket_addrs() {
+            if let Some(a) = addr.filter(|a| a.is_ipv4()).next() {
+                builder = builder.resolve(&host, a);
+            }
+        }
+    }
+    builder.build().expect("failed to build http client")
+}
+
+fn upstream_hosts() -> Vec<String> {
+    let mut hosts = Vec::new();
+    for (host, _) in APT_HOSTS {
+        if let Some(rest) = host.strip_prefix("http://") {
+            if let Some(h) = rest.split('/').next() {
+                hosts.push(h.to_string());
+            }
+        }
+    }
+    for (_, base) in DNF_REPOS {
+        if let Some(rest) = base.strip_prefix("http://") {
+            if let Some(h) = rest.split('/').next() {
+                hosts.push(h.to_string());
+            }
+        }
+    }
+    hosts
+}
+
+impl Catalog {
+    pub async fn load(dir: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        std::fs::create_dir_all(dir)?;
+        let data = tokio::fs::read(dir.join("catalog.json"))
+            .await
+            .ok()
+            .and_then(|b| serde_json::from_slice::<CatalogData>(&b).ok())
+            .unwrap_or_default();
+        Ok(Catalog {
+            dir: dir.to_path_buf(),
+            data: RwLock::new(data),
+            syncing: Mutex::new(false),
+        })
+    }
+
+    pub async fn snapshot(&self) -> HashMap<String, LatestPackage> {
+        self.data.read().await.packages.clone()
+    }
+
+    pub async fn latest(&self, name: &str, family: &str) -> Option<LatestPackage> {
+        self.data
+            .read()
+            .await
+            .packages
+            .get(&key_of(family, name))
+            .cloned()
+    }
+
+    pub async fn sync(&self, client: &reqwest::Client) -> Result<SyncReport, String> {
+        let mut guard = self.syncing.lock().await;
+        if *guard {
+            return Err("sync already in progress".to_string());
+        }
+        *guard = true;
+        let result = self.do_sync(client).await;
+        *guard = false;
+        result
+    }
+
+    async fn do_sync(&self, client: &reqwest::Client) -> Result<SyncReport, String> {
+        let mut merged: HashMap<String, LatestPackage> = HashMap::new();
+        let mut apt_count = 0usize;
+        let mut dnf_count = 0usize;
+
+        for (host, suites) in APT_HOSTS {
+            for suite in *suites {
+                for comp in APT_COMPONENTS {
+                    let url = format!(
+                        "{host}/dists/{suite}/{comp}/binary-{}/Packages.gz",
+                        APT_ARCH
+                    );
+                    tracing::info!("syncing apt: {url}");
+                    let bytes = fetch(client, &url).await?;
+                    let parsed = parse_packages_gz(&bytes).map_err(|e| e.to_string())?;
+                    for para in parsed {
+                        let name = para.get("Package").cloned().unwrap_or_default();
+                        let version = para.get("Version").cloned().unwrap_or_default();
+                        let arch = para.get("Architecture").cloned().unwrap_or_default();
+                        if name.is_empty() || version.is_empty() {
+                            continue;
+                        }
+                        insert_latest(
+                            &mut merged,
+                            name,
+                            version,
+                            DistroFamily::Debian,
+                            format!("{suite}/{comp}"),
+                            arch,
+                        );
+                        apt_count += 1;
+                    }
+                }
+            }
+        }
+
+        for (repo, base) in DNF_REPOS {
+            tracing::info!("syncing dnf: {base}");
+            let repomd = fetch(client, &format!("{base}/repodata/repomd.xml")).await?;
+            let primary_rel = primary_location(&repomd).ok_or_else(|| {
+                format!("no primary metadata found in repomd.xml for {repo}")
+            })?;
+            let primary = fetch(client, &format!("{base}/{primary_rel}")).await?;
+            let pkgs = parse_primary_gz(&primary).map_err(|e| e.to_string())?;
+            for p in pkgs {
+                insert_latest(
+                    &mut merged,
+                    p.0,
+                    p.1,
+                    DistroFamily::Rhel,
+                    repo.to_string(),
+                    p.2,
+                );
+                dnf_count += 1;
+            }
+        }
+
+        let data = CatalogData {
+            packages: merged,
+        };
+        let bytes = serde_json::to_vec_pretty(&data).map_err(|e| e.to_string())?;
+        tokio::fs::write(self.dir.join("catalog.json"), bytes)
+            .await
+            .map_err(|e| e.to_string())?;
+        *self.data.write().await = data;
+
+        let report = SyncReport {
+            packages: self.data.read().await.packages.len(),
+            apt: apt_count,
+            dnf: dnf_count,
+        };
+        tracing::info!("catalog sync complete: {report:?}");
+        Ok(report)
+    }
+}
+
+async fn fetch(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("GET {url}: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("GET {url}: HTTP {}", resp.status()));
+    }
+    resp.bytes()
+        .await
+        .map(|b| b.to_vec())
+        .map_err(|e| format!("read {url}: {e}"))
+}
+
+fn parse_packages_gz(data: &[u8]) -> Result<Vec<HashMap<String, String>>, std::io::Error> {
+    let mut text = String::new();
+    GzDecoder::new(data).read_to_string(&mut text)?;
+    let mut out = Vec::new();
+    let mut cur = HashMap::new();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+            continue;
+        }
+        if line.starts_with(' ') || line.starts_with('\t') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            cur.insert(k.trim().to_string(), v.trim().to_string());
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    Ok(out)
+}
+
+fn primary_location(repomd: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(repomd);
+    let mut in_primary = false;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with("<data") && t.contains("type=\"primary\"") {
+            in_primary = true;
+            continue;
+        }
+        if in_primary && t.starts_with("<location") {
+            let href = t.split("href=\"").nth(1)?;
+            let href = href.split('"').next()?.to_string();
+            return Some(href);
+        }
+        if t.starts_with("</data>") {
+            in_primary = false;
+        }
+    }
+    None
+}
+
+fn parse_primary_gz(data: &[u8]) -> Result<Vec<(String, String, String)>, Box<dyn std::error::Error>> {
+    let mut gz = GzDecoder::new(data);
+    let mut xml = Vec::new();
+    gz.read_to_end(&mut xml)?;
+
+    let mut reader = quick_xml::Reader::from_reader(&xml[..]);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut out = Vec::new();
+    let mut name = String::new();
+    let mut ver = String::new();
+    let mut rel = String::new();
+    let mut arch = String::new();
+    let mut in_pkg = false;
+    let mut cur = String::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(quick_xml::events::Event::Start(e)) => {
+                let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                match tag.as_str() {
+                    "package" => {
+                        in_pkg = true;
+                        name.clear();
+                        ver.clear();
+                        rel.clear();
+                        arch.clear();
+                    }
+                    "version" => {
+                        for a in e.attributes().flatten() {
+                            let k = String::from_utf8_lossy(a.key.as_ref()).to_string();
+                            let v = String::from_utf8_lossy(&a.value).to_string();
+                            if k == "ver" {
+                                ver = v;
+                            } else if k == "rel" {
+                                rel = v;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                cur = tag;
+            }
+            Ok(quick_xml::events::Event::Empty(e)) => {
+                let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                if tag == "version" {
+                    for a in e.attributes().flatten() {
+                        let k = String::from_utf8_lossy(a.key.as_ref()).to_string();
+                        let v = String::from_utf8_lossy(&a.value).to_string();
+                        if k == "ver" {
+                            ver = v;
+                        } else if k == "rel" {
+                            rel = v;
+                        }
+                    }
+                }
+                cur.clear();
+            }
+            Ok(quick_xml::events::Event::Text(t)) => {
+                if in_pkg && cur == "name" {
+                    name = t.unescape().unwrap_or_default().into_owned();
+                } else if in_pkg && cur == "arch" {
+                    arch = t.unescape().unwrap_or_default().into_owned();
+                }
+            }
+            Ok(quick_xml::events::Event::End(e)) => {
+                let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                if tag == "package" {
+                    in_pkg = false;
+                    if !name.is_empty() && !ver.is_empty() {
+                        let version = if rel.is_empty() {
+                            ver.clone()
+                        } else {
+                            format!("{ver}-{rel}")
+                        };
+                        out.push((name.clone(), version, arch.clone()));
+                    }
+                }
+                cur.clear();
+            }
+            Ok(quick_xml::events::Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    Ok(out)
+}
+
+pub fn key_of(family: &str, name: &str) -> String {
+    format!("{}/{}", family.to_lowercase(), name.to_lowercase())
+}
+
+fn insert_latest(
+    map: &mut HashMap<String, LatestPackage>,
+    name: String,
+    version: String,
+    family: DistroFamily,
+    repo: String,
+    arch: String,
+) {
+    let family = format!("{family:?}").to_lowercase();
+    let key = key_of(&family, &name);
+    let entry = LatestPackage {
+        name: name.clone(),
+        version,
+        family: family.clone(),
+        repo,
+        arch,
+    };
+    match map.get(&key) {
+        Some(existing) if !version_gt(&entry.version, &existing.version) => {}
+        _ => {
+            map.insert(key, entry);
+        }
+    }
+}
+
+fn split_epoch(v: &str) -> (i64, &str) {
+    if let Some(pos) = v.find(':') {
+        if pos > 0 && v[..pos].chars().all(|c| c.is_ascii_digit()) {
+            return (v[..pos].parse().unwrap_or(0), &v[pos + 1..]);
+        }
+    }
+    (0, v)
+}
+
+pub fn version_gt(a: &str, b: &str) -> bool {
+    let (ea, av) = split_epoch(a);
+    let (eb, bv) = split_epoch(b);
+    if ea != eb {
+        return ea > eb;
+    }
+    let at: Vec<&str> = av.split(['.', '-', '~']).collect();
+    let bt: Vec<&str> = bv.split(['.', '-', '~']).collect();
+    let n = at.len().max(bt.len());
+    for i in 0..n {
+        let x = at.get(i).copied().unwrap_or("0");
+        let y = bt.get(i).copied().unwrap_or("0");
+        let xi: i64 = x
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .unwrap_or(0);
+        let yi: i64 = y
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .unwrap_or(0);
+        if xi != yi {
+            return xi > yi;
+        }
+        let xr = x.trim_start_matches(|c: char| c.is_ascii_digit());
+        let yr = y.trim_start_matches(|c: char| c.is_ascii_digit());
+        match xr.cmp(yr) {
+            std::cmp::Ordering::Greater => return true,
+            std::cmp::Ordering::Less => return false,
+            _ => {}
+        }
+    }
+    false
+}
