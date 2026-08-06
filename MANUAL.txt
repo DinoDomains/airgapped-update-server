@@ -65,21 +65,34 @@ RUN THE SERVER (on the machine that will be the update server)
     POST /inventory  agent_id + inventory
     POST /updates    agent_id          -> pending updates list
     POST /report     agent_id + update_id + status
-    GET  /health     -> "ok"
+    GET  /health     -> JSON: status, agents, pending_approvals, last sync
 
   DASHBOARD (plain HTTP on :8080 - point a browser at the server's IP):
-    GET  /                        web dashboard
-    GET  /api/devices             all registered devices
+    GET  /                        web dashboard (v2)
+    GET  /api/devices             all devices + per-device update counts
     GET  /api/devices/<id>/packages   per-device installed vs latest
     POST /api/refresh             sync upstream apt/dnf metadata (catalog)
+    GET  /api/refresh/status      live sync progress (phase/elapsed)
     POST /api/update              {"agent_id":..,"package":..} -> approval
     GET  /api/updates             pending update approvals
+    GET  /api/audit               recent audit-log entries (operator actions)
+    GET  /api/health              JSON health (devices, pending, last sync)
+
+  On the server, an append-only audit log is kept in the state directory as
+  <AIRGAP_STORE_DIR>/audit.log (one JSON line per operator action: approvals,
+  catalog refreshes, agent enrollments/registrations). It is NOT the same as
+  reports.json (which is agent-reported install status).
+
+  State files are written via temp-file + atomic rename so a crash mid-write
+  cannot corrupt them.
 
   Open the dashboard at:  http://<server-ip>:8080
-  It lists every device, and for each device shows its installed software
-  with the latest upstream version alongside. "Refresh package catalog"
-  fetches latest versions from Ubuntu (noble) and Rocky 8 metadata.
-  "Approve & update" asks for confirmation and records an approval.
+  It shows a card per device (hostname, OS, arch/kernel, IP, live relative
+  last-seen, status, and how many updates are available). Clicking a card
+  opens a drawer with that device's installed software vs the latest
+  upstream version. "Refresh package catalog" shows live progress and fetches
+  latest versions from Ubuntu (noble) and Rocky 8 metadata. "Approve &
+  update" asks for confirmation and records an approval.
 
 PROVISION AN AGENT (isolated machine)
 -------------------------------------
@@ -113,11 +126,14 @@ VERIFY / MANUAL TEST
   3. Check registered agents on the server:
        /var/lib/airgap-server/agents.json
   4. Open the dashboard:   http://<server-ip>:8080
-       - devices are listed with IP, OS, arch, kernel, status
-       - click a device to see its software with installed vs latest version
-       - "Refresh package catalog" fetches latest versions from upstream
+       - devices are shown as cards with IP, OS, arch, kernel, status and
+         the number of available updates
+       - click a card to open a drawer with installed vs latest versions
+       - "Refresh package catalog" shows live progress and fetches latest
        - "Approve & update" asks for confirmation and records the approval
-         (shown under "Pending approvals")
+         (pending approvals are listed in the dashboard header)
+  5. Audit log (who did what):
+       tail /var/lib/airgap-server/audit.log
 
 NETWORKING NOTES
 ----------------

@@ -95,7 +95,11 @@ impl Store {
 
     async fn write_json<T: Serialize>(&self, file: &str, value: &T) {
         if let Ok(data) = serde_json::to_vec_pretty(value) {
-            let _ = tokio::fs::write(self.dir.join(file), data).await;
+            let path = self.dir.join(file);
+            let tmp = self.dir.join(format!("{file}.tmp"));
+            if tokio::fs::write(&tmp, data).await.is_ok() {
+                let _ = tokio::fs::rename(&tmp, &path).await;
+            }
         }
     }
 

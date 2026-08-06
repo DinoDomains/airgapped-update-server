@@ -9,7 +9,9 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
+use crate::audit::AuditLog;
 use crate::ca::Ca;
+use crate::catalog::Catalog;
 use crate::store::{AgentRecord, ReportRecord, Store};
 use crate::tls::ClientIdentity;
 
@@ -18,6 +20,8 @@ pub struct ApiState {
     pub store: Arc<Store>,
     pub ca: Arc<tokio::sync::Mutex<Ca>>,
     pub cert_dir: std::path::PathBuf,
+    pub catalog: Arc<Catalog>,
+    pub audit: Arc<AuditLog>,
 }
 
 fn err(status: StatusCode, msg: &str) -> Response {
@@ -48,6 +52,12 @@ pub async fn enroll(
     match ca.issue_client(&agent_id, &st.cert_dir) {
         Ok((cert, key)) => {
             ca.save_serial(&st.cert_dir);
+            st.audit.log(
+                &agent_id,
+                "enroll",
+                &agent_id,
+                "ok",
+            );
             let resp = EnrollResponse {
                 agent_id: agent_id.clone(),
                 cert: cert.pem(),
@@ -94,6 +104,7 @@ pub async fn register(
     };
     st.store.register_agent(record).await;
     tracing::info!("agent registered: {cn}");
+    st.audit.log(cn.as_str(), "register", cn.as_str(), "ok");
     Json(RegisterResponse {
         accepted: true,
         agent_id: cn,
@@ -134,6 +145,26 @@ pub async fn poll(
     };
     let updates = st.store.pending_updates().await;
     Json(PollResponse { updates }).into_response()
+}
+
+pub async fn health(State(st): State<ApiState>) -> Response {
+    let agents = st.store.list_agents().await;
+    let pending = st
+        .store
+        .update_requests()
+        .await
+        .iter()
+        .filter(|u| u.status == "approved-pending")
+        .count();
+    let status = st.catalog.status().await;
+    Json(serde_json::json!({
+        "status": "ok",
+        "agents": agents.len(),
+        "pending_approvals": pending,
+        "last_catalog_sync": status.last_sync,
+        "catalog_syncing": status.syncing,
+    }))
+    .into_response()
 }
 
 pub async fn report(

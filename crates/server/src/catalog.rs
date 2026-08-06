@@ -21,9 +21,33 @@ pub struct CatalogData {
     pub packages: HashMap<String, LatestPackage>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct SyncStatus {
+    pub syncing: bool,
+    pub phase: String,
+    pub started: Option<u64>,
+    pub elapsed: u64,
+    pub last: Option<SyncReport>,
+    pub last_sync: Option<String>,
+}
+
+impl Default for SyncStatus {
+    fn default() -> Self {
+        SyncStatus {
+            syncing: false,
+            phase: "idle".to_string(),
+            started: None,
+            elapsed: 0,
+            last: None,
+            last_sync: None,
+        }
+    }
+}
+
 pub struct Catalog {
     dir: PathBuf,
     data: RwLock<CatalogData>,
+    status: RwLock<SyncStatus>,
     syncing: Mutex<bool>,
 }
 
@@ -93,12 +117,21 @@ impl Catalog {
         Ok(Catalog {
             dir: dir.to_path_buf(),
             data: RwLock::new(data),
+            status: RwLock::new(SyncStatus::default()),
             syncing: Mutex::new(false),
         })
     }
 
     pub async fn snapshot(&self) -> HashMap<String, LatestPackage> {
         self.data.read().await.packages.clone()
+    }
+
+    pub async fn status(&self) -> SyncStatus {
+        let mut st = self.status.read().await.clone();
+        if let Some(started) = st.started {
+            st.elapsed = now_secs().saturating_sub(started);
+        }
+        st
     }
 
     pub async fn latest(&self, name: &str, family: &str) -> Option<LatestPackage> {
@@ -116,9 +149,31 @@ impl Catalog {
             return Err("sync already in progress".to_string());
         }
         *guard = true;
+        {
+            let mut st = self.status.write().await;
+            st.syncing = true;
+            st.started = Some(now_secs());
+            st.phase = "starting".to_string();
+        }
         let result = self.do_sync(client).await;
+        {
+            let mut st = self.status.write().await;
+            st.syncing = false;
+            match &result {
+                Ok(r) => {
+                    st.phase = "complete".to_string();
+                    st.last = Some(r.clone());
+                    st.last_sync = Some(now_secs().to_string());
+                }
+                Err(_) => st.phase = "failed".to_string(),
+            }
+        }
         *guard = false;
         result
+    }
+
+    async fn set_phase(&self, phase: &str) {
+        self.status.write().await.phase = phase.to_string();
     }
 
     async fn do_sync(&self, client: &reqwest::Client) -> Result<SyncReport, String> {
@@ -126,6 +181,7 @@ impl Catalog {
         let mut apt_count = 0usize;
         let mut dnf_count = 0usize;
 
+        self.set_phase("fetching apt metadata").await;
         for (host, suites) in APT_HOSTS {
             for suite in *suites {
                 for comp in APT_COMPONENTS {
@@ -157,6 +213,7 @@ impl Catalog {
             }
         }
 
+        self.set_phase("fetching dnf metadata").await;
         for (repo, base) in DNF_REPOS {
             tracing::info!("syncing dnf: {base}");
             let repomd = fetch(client, &format!("{base}/repodata/repomd.xml")).await?;
@@ -178,11 +235,17 @@ impl Catalog {
             }
         }
 
+        self.set_phase("merging").await;
         let data = CatalogData {
             packages: merged,
         };
         let bytes = serde_json::to_vec_pretty(&data).map_err(|e| e.to_string())?;
-        tokio::fs::write(self.dir.join("catalog.json"), bytes)
+        let path = self.dir.join("catalog.json");
+        let tmp = self.dir.join("catalog.json.tmp");
+        tokio::fs::write(&tmp, bytes)
+            .await
+            .map_err(|e| e.to_string())?;
+        tokio::fs::rename(&tmp, &path)
             .await
             .map_err(|e| e.to_string())?;
         *self.data.write().await = data;
@@ -349,6 +412,13 @@ fn parse_primary_gz(data: &[u8]) -> Result<Vec<(String, String, String)>, Box<dy
 
 pub fn key_of(family: &str, name: &str) -> String {
     format!("{}/{}", family.to_lowercase(), name.to_lowercase())
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn insert_latest(

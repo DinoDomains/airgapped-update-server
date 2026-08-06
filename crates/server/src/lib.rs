@@ -1,4 +1,5 @@
 pub mod api;
+pub mod audit;
 pub mod ca;
 pub mod catalog;
 pub mod http;
@@ -41,11 +42,14 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let ca = Arc::new(Mutex::new(ca::Ca::load_or_create(&store_dir.join("ca"))?));
     let store = Arc::new(store::Store::load(&store_dir).await?);
     let catalog = Arc::new(catalog::Catalog::load(&store_dir).await?);
+    let audit = Arc::new(audit::AuditLog::new(&store_dir));
 
     let api_state = ApiState {
         store: store.clone(),
         ca: ca.clone(),
         cert_dir: cert_dir.clone(),
+        catalog: catalog.clone(),
+        audit: audit.clone(),
     };
 
     let api_app = Router::new()
@@ -54,7 +58,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .route("/inventory", post(api::inventory))
         .route("/updates", post(api::poll))
         .route("/report", post(api::report))
-        .route("/health", get(|| async { "ok" }))
+        .route("/health", get(api::health))
         .with_state(api_state)
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024));
 
@@ -65,14 +69,18 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let http_state = HttpState {
         store: store.clone(),
         catalog: catalog.clone(),
+        audit: audit.clone(),
     };
     let http_app = Router::new()
         .route("/", get(http::dashboard))
         .route("/api/devices", get(http::devices))
         .route("/api/devices/:id/packages", get(http::device_packages))
         .route("/api/refresh", post(http::refresh_catalog))
+        .route("/api/refresh/status", get(http::refresh_status))
         .route("/api/update", post(http::request_update))
         .route("/api/updates", get(http::pending_updates))
+        .route("/api/audit", get(http::audit_log))
+        .route("/api/health", get(http::health))
         .with_state(http_state);
     let http_task = http::serve(http_listen, http_app);
 
