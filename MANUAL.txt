@@ -1,0 +1,112 @@
+AIRGAP UPDATE PLATFORM - BETA 0.1.0 - RUN MANUAL
+================================================
+Mutual-TLS update server + isolated agents (M0 milestone).
+Last updated with the beta push.
+
+WHAT THIS IS
+------------
+A central server (airgap-server) that is the ONLY machine online, plus
+lightweight agents (airgap-agent) that run on isolated machines and only
+talk to the server over mutual TLS. Agents enroll once with a token, get a
+client certificate, register, and report their package inventory. The
+server stores everything in JSON.
+
+REPOSITORY LAYOUT
+-----------------
+  Cargo.toml            Cargo workspace (proto + server + agent crates)
+  crates/proto          shared wire types (the API contract)
+  crates/server         the server: CA, mTLS endpoint, JSON store, routes
+  crates/agent          the agent: inventory, enrollment, registration, poll
+  MANUAL.txt            this file
+
+PREREQUISITES (on the build machine)
+------------------------------------
+  - Rust stable toolchain
+  - musl target (for fully static binaries):
+        rustup target add x86_64-unknown-linux-musl
+  - An internal CA provisioned by the server on first boot.
+
+BUILD
+-----
+  # debug
+  cargo build
+
+  # release (static, recommended for deployment):
+  cargo build --release --target x86_64-unknown-linux-musl
+
+  Binaries:
+    target/x86_64-unknown-linux-musl/release/airgap-server
+    target/x86_64-unknown-linux-musl/release/airgap-agent
+
+RUN THE SERVER (on the machine that will be the update server)
+--------------------------------------------------------------
+  AIRGAP_STORE_DIR=/var/lib/airgap-server \
+  AIRGAP_LISTEN=0.0.0.0:8443 \
+  ./target/x86_64-unknown-linux-musl/release/airgap-server
+
+  Environment variables:
+    AIRGAP_STORE_DIR    state directory (agents.json, reports.json,
+                        catalog.json, tokens.json, ca/, certs/)
+                        DEFAULT: "data" (relative to CWD - always set this!)
+    AIRGAP_LISTEN       listen address           DEFAULT: 0.0.0.0:8443
+    AIRGAP_ENROLL_TOKEN enrollment token seed    DEFAULT: airgap-bootstrap
+
+  On first boot the server generates its own CA (ca.pem + ca-key.pem),
+  a server certificate, and the default enrollment token. Keep the state
+  directory! If you restart without AIRGAP_STORE_DIR a fresh CA is created
+  and every already-provisioned agent becomes invalid.
+
+  API endpoints (all JSON, HTTPS):
+    POST /enroll     token + hostname  -> agent_id, client cert, key, CA
+    POST /register   agent_id + inventory
+    POST /inventory  agent_id + inventory
+    POST /updates    agent_id          -> pending updates list
+    POST /report     agent_id + update_id + status
+    GET  /health     -> "ok"
+
+PROVISION AN AGENT (isolated machine)
+-------------------------------------
+  On each agent machine:
+  1. Copy the server's CA certificate to the agent's state dir:
+        scp /var/lib/airgap-server/ca/ca.pem root@<agent>:/var/lib/airgap-agent/ca.pem
+  2. Copy the airgap-agent binary to /usr/local/bin/airgap-agent
+  3. Run once with the enrollment token:
+        AIRGAP_STATE_DIR=/var/lib/airgap-agent \
+        AIRGAP_SERVER=https://<server-ip>:8443 \
+        AIRGAP_ENROLL_TOKEN=airgap-bootstrap \
+        /usr/local/bin/airgap-agent
+
+  The agent enrolls, saves client.pem / client-key.pem (0600) and agent-id,
+  registers, reports inventory, and polls for updates. Subsequent runs reuse
+  the client certificate (no token needed).
+
+  Environment variables (agent):
+    AIRGAP_SERVER    server base URL   DEFAULT: https://172.16.5.20:8443
+    AIRGAP_STATE_DIR state directory   DEFAULT: /var/lib/airgap-agent
+    AIRGAP_ENROLL_TOKEN                only needed on first enroll
+
+VERIFY
+------
+  On the server, inspect the state:
+    /var/lib/airgap-server/agents.json   (registered agents + inventories)
+    /var/lib/airgap-server/reports.json  (install reports)
+  Or on the agent, run the agent again - it should log
+  "registered as <agent-id>" and "server offered 0 update(s)".
+
+NETWORKING NOTES
+----------------
+  - Agents must be able to reach the server's port 8443 (TCP).
+  - For air-gapped use, put the server on the only internet-connected
+    network and keep agents on an isolated subnet (no default route).
+  - If firewalld is used:  firewall-cmd --add-port=8443/tcp
+  - mTLS: agents must trust the server cert (ca.pem). The server only
+    accepts clients with a certificate it issued (cert CN must match the
+    agent_id on /register, /inventory, /report).
+
+KNOWN LIMITATIONS (BETA)
+------------------------
+  - JSON file store (no database yet).
+  - /updates always returns an empty list (package mirroring + approval
+    rings are the next milestone).
+  - Enrollment token is a single shared secret.
+  - SELinux left Permissive in the lab; needs a hardening pass for prod.
