@@ -52,6 +52,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         cert_dir: cert_dir.clone(),
         catalog: catalog.clone(),
         audit: audit.clone(),
+        rate: api::RateLimiter::default(),
     };
 
     let api_app = Router::new()
@@ -66,7 +67,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let tls_config = ca.lock().await.tls_server_config()?;
     let acceptor = TlsAcceptor::from(Arc::new(tls_config));
-    let api_task = tls::serve(listen, acceptor, api_app);
+    let api_task = tls::serve(listen, acceptor, api_app, store.clone());
 
     let http_state = HttpState {
         store: store.clone(),
@@ -90,9 +91,57 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/operators", get(http::list_operators))
         .route("/api/operators", post(http::create_operator))
         .route("/api/operators/:name", delete(http::delete_operator))
+        .route("/api/policy", get(http::get_policy))
+        .route("/api/policy", post(http::set_policy))
+        .route("/api/policy/entries", post(http::upsert_policy_entry))
+        .route(
+            "/api/policy/entries/:name",
+            delete(http::delete_policy_entry),
+        )
+        .route("/api/rings", get(http::rings))
+        .route("/api/update/:id/promote", post(http::promote_update))
+        .route("/api/catalog", get(http::search_catalog))
+        .route("/api/agents/:id/revoke", post(http::revoke_agent))
+        .route("/api/agents/revoked", get(http::list_revoked))
         .with_state(http_state);
     let http_task = http::serve(http_listen, http_app);
 
     tokio::try_join!(api_task, http_task)?;
+    Ok(())
+}
+
+/// Writes a gzipped tar backup of the state directory (CA, certs, JSON
+/// stores, audit log) to `out`. Used by `airgap-server backup`.
+pub fn backup(store_dir: &std::path::Path, out: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    if !store_dir.is_dir() {
+        return Err(format!("store dir {} not found", store_dir.display()).into());
+    }
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::File::create(out)?;
+    let enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+    let mut tar = tar::Builder::new(enc);
+    add_dir_to_tar(&mut tar, store_dir, store_dir)?;
+    let enc = tar.into_inner()?;
+    enc.finish()?;
+    Ok(())
+}
+
+fn add_dir_to_tar(
+    tar: &mut tar::Builder<flate2::write::GzEncoder<std::fs::File>>,
+    base: &std::path::Path,
+    dir: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        let rel = path.strip_prefix(base)?;
+        if path.is_dir() {
+            tar.append_dir(&rel, &path)?;
+            add_dir_to_tar(tar, base, &path)?;
+        } else {
+            tar.append_path_with_name(&path, &rel)?;
+        }
+    }
     Ok(())
 }

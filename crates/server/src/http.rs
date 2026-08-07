@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use airgap_proto::OsInventory;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::{Json, Router};
@@ -12,7 +12,7 @@ use tokio::net::TcpListener;
 use crate::audit::AuditLog;
 use crate::auth::{Auth, Session};
 use crate::catalog::{Catalog, LatestPackage};
-use crate::store::{AgentRecord, Store, UpdateRequest};
+use crate::store::{AgentRecord, Policy, Store, UpdateRequest};
 
 #[derive(Clone)]
 pub struct HttpState {
@@ -133,6 +133,7 @@ struct PkgRow {
     source: String,
     latest: Option<String>,
     update_available: bool,
+    policy: String,
 }
 
 pub async fn dashboard() -> Html<&'static str> {
@@ -173,6 +174,7 @@ pub async fn device_packages(
         return Json(serde_json::json!({ "agent_id": id, "packages": [] })).into_response();
     };
     let catalog = st.catalog.snapshot().await;
+    let policy = st.store.policy_snapshot().await;
 
     let mut rows: Vec<PkgRow> = inv
         .packages
@@ -190,6 +192,11 @@ pub async fn device_packages(
                 source: p.source.clone(),
                 latest,
                 update_available,
+                policy: if policy_allows_local(&policy, &p.name) {
+                    "allow".to_string()
+                } else {
+                    "deny".to_string()
+                },
             }
         })
         .collect();
@@ -365,6 +372,195 @@ pub async fn delete_operator(
     }
 }
 
+pub async fn get_policy(State(st): State<HttpState>, headers: HeaderMap) -> Response {
+    let _session = match require_role(&st, &headers, crate::auth::ROLE_ADMIN).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    Json(st.store.policy_snapshot().await).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct SetPolicyBody {
+    pub default_deny: bool,
+}
+
+pub async fn set_policy(State(st): State<HttpState>, headers: HeaderMap, Json(b): Json<SetPolicyBody>) -> Response {
+    let session = match require_role(&st, &headers, crate::auth::ROLE_ADMIN).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    st.store.set_policy_default_deny(b.default_deny).await;
+    st.audit
+        .log(&session.operator, "policy_set", "default_deny", &format!("{}", b.default_deny));
+    Json(serde_json::json!({ "ok": true })).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct PolicyEntryBody {
+    pub package: String,
+    pub action: String,
+    pub note: Option<String>,
+}
+
+pub async fn upsert_policy_entry(
+    State(st): State<HttpState>,
+    headers: HeaderMap,
+    Json(b): Json<PolicyEntryBody>,
+) -> Response {
+    let session = match require_role(&st, &headers, crate::auth::ROLE_ADMIN).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    if !matches!(b.action.as_str(), "allow" | "deny") {
+        return err(StatusCode::BAD_REQUEST, "action must be 'allow' or 'deny'");
+    }
+    if b.package.trim().is_empty() {
+        return err(StatusCode::BAD_REQUEST, "package is required");
+    }
+    st.store
+        .upsert_policy_entry(b.package.trim(), &b.action, b.note.as_deref().unwrap_or(""))
+        .await;
+    st.audit
+        .log(&session.operator, "policy_entry", b.package.trim(), &b.action);
+    Json(serde_json::json!({ "ok": true })).into_response()
+}
+
+pub async fn delete_policy_entry(
+    State(st): State<HttpState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let session = match require_role(&st, &headers, crate::auth::ROLE_ADMIN).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    if st.store.delete_policy_entry(&name).await {
+        st.audit
+            .log(&session.operator, "policy_entry_delete", &name, "ok");
+        Json(serde_json::json!({ "ok": true })).into_response()
+    } else {
+        err(StatusCode::NOT_FOUND, "policy entry not found")
+    }
+}
+
+pub async fn rings(State(st): State<HttpState>, headers: HeaderMap) -> Response {
+    let _session = match current_user(&st, &headers).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let ups = st.store.update_requests().await;
+    let mut groups: HashMap<String, Vec<UpdateRequest>> = HashMap::new();
+    for u in ups {
+        groups.entry(u.ring.clone()).or_default().push(u);
+    }
+    for v in groups.values_mut() {
+        v.sort_by(|a, b| b.ts.cmp(&a.ts));
+    }
+    Json(serde_json::json!({
+        "dev": groups.get("dev").cloned().unwrap_or_default(),
+        "staging": groups.get("staging").cloned().unwrap_or_default(),
+        "prod": groups.get("prod").cloned().unwrap_or_default(),
+    }))
+    .into_response()
+}
+
+pub async fn promote_update(
+    State(st): State<HttpState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let session = match require_role(&st, &headers, crate::auth::ROLE_APPROVER).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match st.store.promote_update(&id).await {
+        Ok(r) => {
+            st.audit.log(&session.operator, "ring_promote", &id, &r.ring);
+            Json(r).into_response()
+        }
+        Err(e) => err(StatusCode::BAD_REQUEST, &e),
+    }
+}
+
+pub async fn search_catalog(
+    State(st): State<HttpState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
+    let _session = match current_user(&st, &headers).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let q = params.get("q").cloned().unwrap_or_default().to_lowercase();
+    let page = params
+        .get("page")
+        .and_then(|p| p.parse::<usize>().ok())
+        .unwrap_or(1)
+        .max(1);
+    let per = params
+        .get("per")
+        .and_then(|p| p.parse::<usize>().ok())
+        .unwrap_or(100)
+        .clamp(1, 500);
+    let snap = st.catalog.snapshot().await;
+    let mut items: Vec<LatestPackage> = snap.into_values().collect();
+    if !q.is_empty() {
+        items.retain(|p| p.name.to_lowercase().contains(&q));
+    }
+    items.sort_by(|a, b| a.name.cmp(&b.name));
+    let total = items.len();
+    let start = (page - 1) * per;
+    let page_items: Vec<LatestPackage> = items.into_iter().skip(start).take(per).collect();
+    Json(serde_json::json!({
+        "total": total,
+        "page": page,
+        "per": per,
+        "items": page_items,
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+pub struct RevokeBody {
+    pub reason: Option<String>,
+}
+
+pub async fn revoke_agent(
+    State(st): State<HttpState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(b): Json<RevokeBody>,
+) -> Response {
+    let session = match require_role(&st, &headers, crate::auth::ROLE_ADMIN).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let reason = b.reason.unwrap_or_default();
+    match st.store.revoke_agent(&id, &reason).await {
+        true => {
+            st.audit.log(&session.operator, "agent_revoke", &id, "ok");
+            Json(serde_json::json!({ "ok": true })).into_response()
+        }
+        false => err(StatusCode::CONFLICT, "agent already revoked"),
+    }
+}
+
+pub async fn list_revoked(State(st): State<HttpState>, headers: HeaderMap) -> Response {
+    let _session = match require_role(&st, &headers, crate::auth::ROLE_ADMIN).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    Json(st.store.list_revoked().await).into_response()
+}
+
+fn policy_allows_local(p: &Policy, name: &str) -> bool {
+    match p.entries.get(&name.to_lowercase()) {
+        Some(e) => e.action == "allow",
+        None => !p.default_deny,
+    }
+}
+
 #[derive(Deserialize)]
 pub struct UpdateBody {
     pub agent_id: String,
@@ -404,6 +600,12 @@ pub async fn request_update(
     };
     if latest.version == installed.version {
         return err(StatusCode::BAD_REQUEST, "already up to date");
+    }
+    if !st.store.policy_allows(&key).await {
+        return err(
+            StatusCode::FORBIDDEN,
+            "blocked by source policy (not in allowlist / default-deny is on)",
+        );
     }
 
     let ts = now_ts();
@@ -501,6 +703,10 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
   .chip { display:inline-block; padding:2px 8px; border-radius:10px; font-size:11px; font-weight:700; }
   .chip.ok { background:#052e16; color:var(--ok); } .chip.upd { background:#431407; color:var(--upd); }
   .chip.blocked { background:#3f1d1d; color:var(--red); }
+  .ringpipe { display:grid; grid-template-columns:repeat(3,1fr); gap:16px; margin-top:16px; }
+  .ringcol { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; }
+  .ringcard { background:var(--bg); border:1px solid var(--line); border-radius:6px; padding:10px; margin-bottom:8px; font-size:12px; }
+  #catPages { display:flex; gap:6px; } #catPages .active { color:var(--ac); border-color:var(--ac); }
   .ok { color:var(--ok); } .upd { color:var(--upd); } .mut { color:var(--mut); }
   #toasts { position:fixed; bottom:18px; right:18px; z-index:60; display:flex; flex-direction:column; gap:8px; }
   .toast { background:var(--panel); border:1px solid var(--line); border-left:3px solid var(--ac); padding:10px 14px;
@@ -559,7 +765,10 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     <nav>
       <button class="active" data-view="devices" onclick="showView('devices')">Devices<small>fleet inventory &amp; versions</small></button>
       <button data-view="approvals" onclick="showView('approvals')">Approvals<small>pending update requests</small></button>
+      <button data-view="rings" onclick="showView('rings')">Rings<small>dev &rarr; staging &rarr; prod</small></button>
+      <button data-view="catalog" onclick="showView('catalog')">Catalog<small>upstream package versions</small></button>
       <button data-view="audit" onclick="showView('audit')">Audit log<small>who did what</small></button>
+      <button data-view="policy" id="navPolicy" style="display:none" onclick="showView('policy')">Policy<small>allowlist / default-deny (admin)</small></button>
       <button data-view="operators" id="navOperators" style="display:none" onclick="showView('operators')">Operators<small>accounts &amp; roles (admin)</small></button>
     </nav>
 
@@ -593,14 +802,37 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       </table>
     </div>
 
+    <div class="view" id="viewRings">
+      <div class="headline"><h2>Rings</h2><span class="muted">promote a release down the pipeline: dev &rarr; staging &rarr; prod</span></div>
+      <div class="empty" id="ringEmpty" style="display:none">No releases available yet. Push packages to the server repo, then refresh the package catalog.</div>
+      <div class="ringpipe" id="ringPipe"></div>
+    </div>
+
+    <div class="view" id="viewCatalog">
+      <div class="headline"><h2>Catalog</h2><span class="muted" id="catCount"></span></div>
+      <div class="toolbar">
+        <input id="catSearch" placeholder="search packages" oninput="debouncedSearch()" onkeydown="if(event.key==='Enter')searchCatalog(1)">
+        <button onclick="searchCatalog(1)">Search</button>
+        <button class="ghost" onclick="loadCatalog(1, '')">Reset</button>
+      </div>
+      <div class="empty" id="catEmpty" style="display:none">No packages in the catalog. Refresh the package catalog from Devices.</div>
+      <table style="margin-top:12px">
+        <thead><tr><th>Family</th><th>Package</th><th>Version</th><th>Ring</th><th>Updated</th></tr></thead>
+        <tbody id="catBody"></tbody>
+      </table>
+      <div class="toolbar" id="catPages"></div>
+    </div>
+
     <div class="view" id="viewAudit">
       <div class="headline"><h2>Audit log</h2></div>
       <div class="toolbar">
         <input id="auditActor" placeholder="filter by operator" oninput="renderAudit()">
         <select id="auditAction" onchange="renderAudit()">
           <option value="">all actions</option>
-          <option>login</option><option>approve_update</option><option>catalog_refresh</option>
-          <option>operator_create</option><option>operator_delete</option><option>enroll</option><option>register</option>
+          <option>login</option><option>approve_update</option><option>ring_promote</option>
+          <option>catalog_refresh</option><option>operator_create</option><option>operator_delete</option>
+          <option>policy_set</option><option>policy_entry</option><option>policy_entry_delete</option>
+          <option>agent_revoke</option><option>enroll</option><option>register</option>
         </select>
       </div>
       <div class="empty" id="auditEmpty" style="display:none">No audit entries yet.</div>
@@ -623,6 +855,32 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
         </div>
       </div>
     </div>
+
+    <div class="view" id="viewPolicy">
+      <div class="headline"><h2>Source policy</h2><span class="muted">package allowlist; when default-deny is on, unlisted packages are blocked from updates</span></div>
+      <div class="card" style="margin-top:8px;cursor:default">
+        <h3 style="margin:0 0 10px;font-size:14px">Default rule</h3>
+        <div class="toolbar" style="margin:0">
+          <select id="polMode">
+            <option value="allow">allow by default</option>
+            <option value="deny">deny by default</option>
+          </select>
+          <button onclick="setPolicyMode()">Save</button>
+        </div>
+      </div>
+      <table style="margin-top:12px">
+        <thead><tr><th>Package</th><th>Action</th><th></th></tr></thead>
+        <tbody id="polBody"></tbody>
+      </table>
+      <div class="card" style="margin-top:16px;cursor:default">
+        <h3 style="margin:0 0 10px;font-size:14px">Add rule</h3>
+        <div class="toolbar" style="margin:0">
+          <input id="polName" placeholder="package name, e.g. openssl-libs">
+          <select id="polAction"><option value="deny">deny</option><option value="allow">allow</option></select>
+          <button onclick="addPolicy()">Add rule</button>
+        </div>
+      </div>
+    </div>
   </div>
 </main>
 </div>
@@ -634,12 +892,20 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       <div style="display:flex;align-items:center;gap:8px"><h1 id="drvHost" style="font-size:15px"></h1><span id="drvBadge"></span></div>
       <div class="srv" id="drvMeta"></div>
     </div>
+    <button class="ghost danger" id="drvRevoke" onclick="confirmRevoke()" style="display:none">Revoke</button>
     <button class="ghost" onclick="closeDrawer()">Close</button>
   </header>
   <div class="body">
     <div class="muted" id="drvCount" style="margin-bottom:8px"></div>
     <table>
-      <thead><tr><th>Package</th><th>Installed</th><th>Latest</th><th>Status</th><th></th></tr></thead>
+      <thead><tr>
+        <th onclick="sortRows('name')">Package &darr;&uarr;</th>
+        <th onclick="sortRows('installed')">Installed</th>
+        <th onclick="sortRows('latest')">Latest</th>
+        <th onclick="sortRows('policy')">Policy</th>
+        <th>Status</th>
+        <th></th>
+      </tr></thead>
       <tbody id="drvBody"></tbody>
     </table>
   </div>
@@ -717,6 +983,7 @@ function enterApp(op, r){
   $('#whoami').textContent = op;
   $('#roleBadge').textContent = r;
   $('#navOperators').style.display = r === 'admin' ? 'block' : 'none';
+  $('#navPolicy').style.display = r === 'admin' ? 'block' : 'none';
   $('#user').value=''; $('#pass').value='';
 }
 
@@ -733,8 +1000,11 @@ function showView(v){
   document.querySelector('nav button[data-view="'+v+'"]').classList.add('active');
   if(v==='devices'){ loadDevices(); }
   if(v==='approvals'){ loadApprovals(); }
+  if(v==='rings'){ loadRings(); }
+  if(v==='catalog'){ searchCatalog(1); }
   if(v==='audit'){ loadAudit(); }
   if(v==='operators'){ loadOperators(); }
+  if(v==='policy'){ loadPolicy(); }
 }
 
 async function boot(){
@@ -792,10 +1062,13 @@ async function loadDevices(){
   }catch(e){ toast('Failed to load devices: '+e.message, 'err'); }
 }
 
+let drawerId = null, drawerRows = [], drawerSort = {key:'name', dir:1};
+
 async function openDrawer(id){
   $('#drawer').classList.add('open');
   $('#backdrop').style.display='block';
-  $('#drvBody').innerHTML = '<tr><td colspan="5" class="mut">loading packages&hellip;</td></tr>';
+  drawerId = id;
+  $('#drvBody').innerHTML = '<tr><td colspan="6" class="mut">loading packages&hellip;</td></tr>';
   try{
     const data = await api('/api/devices/'+encodeURIComponent(id)+'/packages');
     const upds = data.packages.filter(p=>p.update_available);
@@ -805,17 +1078,50 @@ async function openDrawer(id){
       : '<span class="badge bg-idle">up to date</span>';
     $('#drvMeta').textContent = id;
     $('#drvCount').textContent = data.packages.length + ' packages installed';
-    $('#drvBody').innerHTML = data.packages.map(p=>`
-      <tr>
-        <td>${esc(p.name)}</td>
-        <td>${esc(p.installed)}</td>
-        <td class="${p.update_available?'upd':'ok'}">${p.latest?esc(p.latest):'<span class="muted">unknown</span>'}</td>
-        <td>${p.update_available?'<span class="chip upd">update available</span>':'<span class="chip ok">up to date</span>'}</td>
-        <td>${(p.update_available && (role==='approver'||role==='admin'))?`<button class="ghost" onclick="askUpdate('${esc(data.agent_id)}','${esc(p.name)}')">Approve &amp; update</button>`:(p.update_available?'<span class="muted">approver role needed</span>':'')}</td>
-      </tr>`).join('');
+    $('#drvRevoke').style.display = role === 'admin' ? 'inline-block' : 'none';
+    drawerRows = data.packages;
+    drawerSort = {key:'name', dir:1};
+    renderDrawerRows();
   }catch(e){
-    $('#drvBody').innerHTML = '<tr><td colspan="5" class="upd">Failed to load: '+esc(e.message)+'</td></tr>';
+    $('#drvBody').innerHTML = '<tr><td colspan="6" class="upd">Failed to load: '+esc(e.message)+'</td></tr>';
   }
+}
+
+function renderDrawerRows(){
+  const rows = drawerRows.slice();
+  const k = drawerSort.key;
+  rows.sort((a,b)=>{
+    const va = (a[k]||'').toString().toLowerCase(), vb = (b[k]||'').toString().toLowerCase();
+    if(k==='installed') return (a[k]<b[k]?-1:a[k]>b[k]?1:0)*drawerSort.dir;
+    if(k==='latest') return ((a[k]||'').localeCompare((b[k]||''), undefined, {numeric:true}))*drawerSort.dir;
+    return va.localeCompare(vb)*drawerSort.dir;
+  });
+  $('#drvBody').innerHTML = rows.map(p=>`
+    <tr>
+      <td>${esc(p.name)}</td>
+      <td>${esc(p.installed)}</td>
+      <td class="${p.update_available?'upd':'ok'}">${p.latest?esc(p.latest):'<span class="muted">unknown</span>'}</td>
+      <td>${p.policy==='allow'?'<span class="chip ok">allow</span>':'<span class="chip upd">blocked</span>'}</td>
+      <td>${p.update_available?'<span class="chip upd">update available</span>':'<span class="chip ok">up to date</span>'}</td>
+      <td>${(p.update_available && (role==='approver'||role==='admin'))?`<button class="ghost" onclick="askUpdate('${esc(drawerId)}','${esc(p.name)}')">Approve</button>`:(p.update_available?'<span class="muted">approver role needed</span>':'')}</td>
+    </tr>`).join('');
+}
+
+function sortRows(key){
+  if(drawerSort.key===key) drawerSort.dir *= -1; else drawerSort = {key, dir:1};
+  renderDrawerRows();
+}
+
+async function confirmRevoke(){
+  if(!drawerId) return;
+  const reason = prompt('Revoke agent '+drawerId+'? Any reason (optional):','');
+  if(reason === null) return;
+  try{
+    await api('/api/agents/'+encodeURIComponent(drawerId)+'/revoke', {method:'POST', body: JSON.stringify({reason})});
+    toast('Agent '+drawerId+' revoked', 'ok');
+    closeDrawer();
+    loadDevices();
+  }catch(e){ toast('Revoke failed: '+e.message, 'err'); }
 }
 
 function closeDrawer(){
@@ -935,6 +1241,109 @@ async function delOp(name){
     await api('/api/operators/'+encodeURIComponent(name), {method:'DELETE'});
     toast('Operator '+name+' deleted', 'ok');
     loadOperators();
+  }catch(e){ toast('Delete failed: '+e.message, 'err'); }
+}
+
+const RING_COLS = ['dev', 'staging', 'prod'];
+async function loadRings(){
+  try{
+    const groups = await api('/api/rings');
+    const has = Object.values(groups).some(a=>a.length);
+    $('#ringEmpty').style.display = has ? 'none' : 'block';
+    $('#ringPipe').innerHTML = RING_COLS.map((r,i)=>{
+      const items = (groups[r]||[]);
+      const canPromote = (role==='approver'||role==='admin') && i < 2;
+      return `<div class="ringcol">
+        <h3 style="font-size:14px;margin:0 0 10px;text-transform:capitalize">${esc(r)} <span class="badge bg-idle">${items.length}</span></h3>
+        ${items.length ? items.map(u=>`
+          <div class="ringcard">
+            <b>${esc(u.package)}</b>
+            <div class="id">${esc(u.agent_id)}</div>
+            <div class="mut">${esc(u.from_version)} &rarr; <b>${esc(u.to_version)}</b></div>
+            <div class="mut">approved by ${esc(u.approved_by||'&ndash;')} &middot; ${rel(u.ts)}</div>
+            ${canPromote ? `<button class="ghost" style="margin-top:8px" onclick="promote('${esc(u.id)}')">Promote to ${RING_COLS[i+1]}</button>` : ''}
+          </div>`).join('') : '<div class="mut">empty</div>'}
+      </div>`;
+    }).join('');
+  }catch(e){ toast('Failed to load rings: '+e.message, 'err'); }
+}
+
+async function promote(id){
+  if(!confirm('Promote this release to the next ring?')) return;
+  try{
+    const r = await api('/api/update/'+encodeURIComponent(id)+'/promote', {method:'POST'});
+    toast('Promoted '+r.package+' to '+r.ring, 'ok');
+    loadRings(); loadApprovals(); loadDevices();
+  }catch(e){ toast('Promote failed: '+e.message, 'err'); }
+}
+
+let catTimer = null;
+function debouncedSearch(){
+  clearTimeout(catTimer);
+  catTimer = setTimeout(()=> searchCatalog(1), 300);
+}
+async function searchCatalog(page){
+  const q = $('#catSearch') ? $('#catSearch').value.trim() : '';
+  try{
+    const r = await api('/api/catalog?q='+encodeURIComponent(q)+'&page='+page+'&per=100');
+    $('#catCount').textContent = '('+r.total+' packages'+(q?' matching &ldquo;'+esc(q)+'&rdquo;':'')+')';
+    $('#catEmpty').style.display = r.items.length ? 'none' : 'block';
+    $('#catBody').innerHTML = r.items.map(p=>`
+      <tr>
+        <td>${familyIcon(p.family)}</td>
+        <td><b>${esc(p.name)}</b></td>
+        <td>${esc(p.version)}</td>
+        <td><span class="badge bg-idle">${esc(p.ring||'')}</span></td>
+        <td class="mut">${rel(p.ts)}</td>
+      </tr>`).join('');
+    const pages = Math.max(1, Math.ceil(r.total/r.per));
+    $('#catPages').innerHTML = (pages>1 ? Array.from({length:pages},(_,i)=>
+      `<button class="ghost ${i+1===page?'active':''}" onclick="searchCatalog(${i+1})">${i+1}</button>`).join('') : '');
+  }catch(e){ toast('Failed to load catalog: '+e.message, 'err'); }
+}
+
+async function loadPolicy(){
+  try{
+    const p = await api('/api/policy');
+    $('#polMode').value = p.default_deny ? 'deny' : 'allow';
+    const entries = Object.entries(p.entries||{});
+    $('#polBody').innerHTML = entries.map(([name,e])=>`
+      <tr>
+        <td><b>${esc(name)}</b>${e.note?'<div class="mut">'+esc(e.note)+'</div>':''}</td>
+        <td><span class="badge ${e.action==='allow'?'bg-online':'bg-upd'}">${esc(e.action)}</span></td>
+        <td><button class="ghost" onclick="delPolicy('${esc(name)}')">Delete</button></td>
+      </tr>`).join('') || '<tr><td colspan="3" class="mut">no explicit rules &mdash; all packages follow the default rule</td></tr>';
+  }catch(e){ toast('Failed to load policy: '+e.message, 'err'); }
+}
+
+async function setPolicyMode(){
+  const deny = $('#polMode').value === 'deny';
+  if(!confirm(deny?'Enable default-deny? Only allowlisted packages will be updatable.':'Set default to allow?')) return;
+  try{
+    await api('/api/policy', {method:'POST', body: JSON.stringify({default_deny: deny})});
+    toast('Default rule saved: '+(deny?'deny all':'allow all'), 'ok');
+    loadPolicy(); loadDevices();
+  }catch(e){ toast('Save failed: '+e.message, 'err'); }
+}
+
+async function addPolicy(){
+  const name = $('#polName').value.trim();
+  const action = $('#polAction').value;
+  if(!name) return;
+  try{
+    await api('/api/policy/entries', {method:'POST', body: JSON.stringify({package: name, action})});
+    toast('Rule added: '+name+' -> '+action, 'ok');
+    $('#polName').value='';
+    loadPolicy(); loadDevices();
+  }catch(e){ toast('Add failed: '+e.message, 'err'); }
+}
+
+async function delPolicy(name){
+  if(!confirm('Delete rule for '+name+'?')) return;
+  try{
+    await api('/api/policy/entries/'+encodeURIComponent(name), {method:'DELETE'});
+    toast('Rule deleted: '+name, 'ok');
+    loadPolicy(); loadDevices();
   }catch(e){ toast('Delete failed: '+e.message, 'err'); }
 }
 

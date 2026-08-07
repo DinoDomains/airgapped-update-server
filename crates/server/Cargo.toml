@@ -30,3 +30,4 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 tower = "0.5"
 argon2.workspace = true
 rand.workspace = true
+tar.workspace = true

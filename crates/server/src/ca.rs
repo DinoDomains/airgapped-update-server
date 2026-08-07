@@ -166,7 +166,16 @@ impl Ca {
     /// Builds a rustls ServerConfig that requires clients to present a cert
     /// signed by this CA. Clients without a certificate are tolerated so that
     /// /enroll can be reached; per-route auth is enforced in the API layer.
+    /// TLS 1.2 is the minimum version and the cipher list is an explicit
+    /// allowlist rather than rustls defaults.
     pub fn tls_server_config(&self) -> Result<ServerConfig, Box<dyn std::error::Error>> {
+        use rustls::crypto::ring::cipher_suite::{
+            TLS13_AES_128_GCM_SHA256, TLS13_AES_256_GCM_SHA384, TLS13_CHACHA20_POLY1305_SHA256,
+            TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+            TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+        };
+        use rustls::version::{TLS12, TLS13};
+
         let mut roots = RootCertStore::empty();
         roots.add(self.ca_cert_der().clone())?;
 
@@ -174,7 +183,21 @@ impl Ca {
             .allow_unauthenticated()
             .build()?;
 
-        let config = ServerConfig::builder()
+        let ring = rustls::crypto::ring::default_provider();
+        let provider = Arc::new(rustls::crypto::CryptoProvider {
+            cipher_suites: vec![
+                TLS13_AES_256_GCM_SHA384,
+                TLS13_AES_128_GCM_SHA256,
+                TLS13_CHACHA20_POLY1305_SHA256,
+                TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+                TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+                TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+            ],
+            ..ring.clone()
+        });
+
+        let config = ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&TLS13, &TLS12])?
             .with_client_cert_verifier(verifier)
             .with_single_cert(
                 vec![self.server_cert_der.clone()],

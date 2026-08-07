@@ -29,6 +29,7 @@ hex = "0.4"
 tokio-util = { version = "0.7", features = ["io"] }
 argon2 = "0.5"
 rand = "0.8"
+tar = "0.4"
 
 [profile.release]
 lto = "thin"

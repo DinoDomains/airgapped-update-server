@@ -37,6 +37,26 @@ pub struct UpdateRequest {
     pub approved_by: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevokedRecord {
+    pub agent_id: String,
+    pub revoked_at: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyEntry {
+    pub action: String,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Policy {
+    pub default_deny: bool,
+    #[serde(default)]
+    pub entries: HashMap<String, PolicyEntry>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Catalog {
     pub updates: Vec<UpdateItem>,
@@ -49,6 +69,8 @@ struct State {
     catalog: Catalog,
     tokens: HashMap<String, String>,
     updates: Vec<UpdateRequest>,
+    revoked: HashMap<String, RevokedRecord>,
+    policy: Policy,
 }
 
 pub struct Store {
@@ -73,6 +95,10 @@ impl Store {
             store.read_json("tokens.json").await.unwrap_or_default();
         store.state.write().await.updates =
             store.read_json("updates.json").await.unwrap_or_default();
+        store.state.write().await.revoked =
+            store.read_json("revoked.json").await.unwrap_or_default();
+        store.state.write().await.policy =
+            store.read_json("policy.json").await.unwrap_or_default();
         {
             let mut state = store.state.write().await;
             if state.tokens.is_empty() {
@@ -172,6 +198,95 @@ impl Store {
 
     pub async fn update_requests(&self) -> Vec<UpdateRequest> {
         self.state.read().await.updates.clone()
+    }
+
+    pub async fn promote_update(&self, id: &str) -> Result<UpdateRequest, String> {
+        let mut state = self.state.write().await;
+        let req = state
+            .updates
+            .iter_mut()
+            .find(|u| u.id == id)
+            .ok_or_else(|| "update request not found".to_string())?;
+        let next = match req.ring.as_str() {
+            "dev" => "staging",
+            "staging" => "prod",
+            "prod" => return Err("already in prod".to_string()),
+            _ => "staging",
+        };
+        req.ring = next.to_string();
+        let snap = state.updates.clone();
+        drop(state);
+        self.write_json("updates.json", &snap).await;
+        Ok(snap.into_iter().find(|u| u.id == id).unwrap())
+    }
+
+    pub async fn revoke_agent(&self, agent_id: &str, reason: &str) -> bool {
+        let mut state = self.state.write().await;
+        let record = RevokedRecord {
+            agent_id: agent_id.to_string(),
+            revoked_at: now_iso(),
+            reason: reason.to_string(),
+        };
+        let inserted = state.revoked.insert(agent_id.to_string(), record).is_none();
+        let snap = state.revoked.clone();
+        drop(state);
+        self.write_json("revoked.json", &snap).await;
+        inserted
+    }
+
+    pub async fn is_revoked(&self, agent_id: &str) -> bool {
+        self.state.read().await.revoked.contains_key(agent_id)
+    }
+
+    pub async fn list_revoked(&self) -> Vec<RevokedRecord> {
+        let mut v: Vec<RevokedRecord> = self.state.read().await.revoked.values().cloned().collect();
+        v.sort_by(|a, b| b.revoked_at.cmp(&a.revoked_at));
+        v
+    }
+
+    pub async fn policy_snapshot(&self) -> Policy {
+        self.state.read().await.policy.clone()
+    }
+
+    pub async fn policy_allows(&self, name: &str) -> bool {
+        let p = &self.state.read().await.policy;
+        match p.entries.get(&name.to_lowercase()) {
+            Some(e) => e.action == "allow",
+            None => !p.default_deny,
+        }
+    }
+
+    pub async fn set_policy_default_deny(&self, default_deny: bool) {
+        let mut state = self.state.write().await;
+        state.policy.default_deny = default_deny;
+        let snap = state.policy.clone();
+        drop(state);
+        self.write_json("policy.json", &snap).await;
+    }
+
+    pub async fn upsert_policy_entry(&self, name: &str, action: &str, note: &str) {
+        let mut state = self.state.write().await;
+        state.policy.entries.insert(
+            name.to_lowercase(),
+            PolicyEntry {
+                action: action.to_string(),
+                note: note.to_string(),
+            },
+        );
+        let snap = state.policy.clone();
+        drop(state);
+        self.write_json("policy.json", &snap).await;
+    }
+
+    pub async fn delete_policy_entry(&self, name: &str) -> bool {
+        let mut state = self.state.write().await;
+        let removed = state.policy.entries.remove(&name.to_lowercase()).is_some();
+        let snap = state.policy.clone();
+        drop(state);
+        if removed {
+            self.write_json("policy.json", &snap).await;
+        }
+        removed
     }
 }
 

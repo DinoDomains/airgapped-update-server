@@ -1,7 +1,7 @@
 AIRGAP UPDATE PLATFORM - BETA 0.1.0 - RUN MANUAL
 ================================================
 Mutual-TLS update server + isolated agents (M0 milestone).
-Last updated with the beta push.
+Last updated with the RBAC/revocation/policy tranche.
 
 WHAT THIS IS
 ------------
@@ -63,11 +63,29 @@ RUN THE SERVER (on the machine that will be the update server)
 
   API endpoints (all JSON, HTTPS on :8443):
     POST /enroll     token + hostname  -> agent_id, client cert, key, CA
-    POST /register   agent_id + inventory
+                     (rate-limited: 20/min per peer IP; revoked agents rejected)
+    POST /register   agent_id + inventory   (rate-limited: 60/min per agent)
     POST /inventory  agent_id + inventory
     POST /updates    agent_id          -> pending updates list
     POST /report     agent_id + update_id + status
     GET  /health     -> JSON: status, agents, pending_approvals, last sync
+
+  Backup (offline archive of the whole store, run on the server):
+    airgap-server backup /var/lib/airgap-server /path/to/backup.tar.gz
+    Produces a gzip'd tar of the state directory (store, CA, certs, audit log).
+
+  TLS hardening (server): only TLS 1.2 and 1.3 are offered, with an explicit
+  cipher-suite allowlist (AES-256-GCM / AES-128-GCM / ChaCha20-Poly1305
+  suites, ECDSA only). TLS 1.1 and older, and non-allowlisted ciphers, are
+  refused at the handshake.
+
+  Certificate revocation: an admin can revoke an agent. Its client
+  certificate is then refused at the TLS layer (connection dropped), its
+  enrollments fail, and the device shows as revoked in the dashboard. The
+  revoke list is stored in <AIRGAP_STORE_DIR>/revoked.json.
+
+  Input hardening: all inventory fields are truncated and stripped of control
+  characters before storage; enrollment and reporting are rate-limited.
 
   DASHBOARD (plain HTTP on :8080 - point a browser at the server's IP):
     GET  /                        web dashboard (v2, login required)
@@ -75,11 +93,21 @@ RUN THE SERVER (on the machine that will be the update server)
     POST /api/logout              ends the session
     GET  /api/me                  current operator + role
     GET  /api/devices             all devices + per-device update counts
-    GET  /api/devices/<id>/packages   per-device installed vs latest
+    GET  /api/devices/<id>/packages   per-device installed vs latest (incl.
+                                      policy verdict per package)
     POST /api/refresh             sync upstream apt/dnf metadata (catalog)
     GET  /api/refresh/status      live sync progress (phase/elapsed)
     POST /api/update              {"agent_id":..,"package":..} -> approval
     GET  /api/updates             pending update approvals
+    GET  /api/rings               releases grouped by ring (dev/staging/prod)
+    POST /api/update/<id>/promote promote a release to the next ring
+    GET  /api/catalog?q=&page=&per=   search the upstream version catalog
+    GET  /api/policy              source policy (admin only)
+    POST /api/policy              set default-deny on/off (admin only)
+    POST /api/policy/entries      add/update an allow/deny rule (admin)
+    DELETE /api/policy/entries/<pkg>  remove a rule (admin)
+    POST /api/agents/<id>/revoke  revoke an agent certificate (admin)
+    GET  /api/agents/revoked      list revoked agents (admin)
     GET  /api/audit               recent audit-log entries (operator actions)
     GET  /api/health              JSON health (devices, pending, last sync)
     GET  /api/operators           list operators (admin only)
@@ -89,10 +117,19 @@ RUN THE SERVER (on the machine that will be the update server)
   Every /api/* call except /api/login requires the session token from login,
   sent as an "Authorization: Bearer <token>" header (the dashboard does this
   automatically). Roles: viewer (read-only), approver (can also approve
-  updates and refresh the catalog), admin (also manages operators).
-  Approvals and refresh require at least the approver role; operator
-  management requires admin. Failed and successful logins are written to the
-  audit log.
+  updates, refresh the catalog, and promote releases between rings), admin
+  (also manages operators, source policy, and agent revocation).
+  Approvals, refresh and ring promotion require at least the approver role;
+  policy/operator/revoke management requires admin. Failed and successful
+  logins are written to the audit log.
+
+  Source policy: a package allowlist stored in <AIRGAP_STORE_DIR>/policy.json.
+  Each rule is "allow" or "deny" for a package name. When default-deny is
+  ON, only allowlisted packages can be approved for update; everything else
+  returns 403 at approval time. When default-deny is OFF (the default), deny
+  rules block specific packages. The dashboard Policies view (admin) edits
+  the default rule and individual entries; the device drawer shows a
+  "blocked" chip on packages that are denied.
 
   First boot creates the operator "admin" with password from the
   AIRGAP_ADMIN_PASSWORD environment variable (default: "admin" - change it!).
@@ -106,13 +143,18 @@ RUN THE SERVER (on the machine that will be the update server)
   State files are written via temp-file + atomic rename so a crash mid-write
   cannot corrupt them.
 
-  Open the dashboard at:  http://<server-ip>:8080
-  It shows a card per device (hostname, OS, arch/kernel, IP, live relative
-  last-seen, status, and how many updates are available). Clicking a card
-  opens a drawer with that device's installed software vs the latest
-  upstream version. "Refresh package catalog" shows live progress and fetches
-  latest versions from Ubuntu (noble) and Rocky 8 metadata. "Approve &
-  update" asks for confirmation and records an approval.
+   Open the dashboard at:  http://<server-ip>:8080
+   It shows a card per device (hostname, OS, arch/kernel, IP, live relative
+   last-seen, status, and how many updates are available). Clicking a card
+   opens a drawer with that device's installed software vs the latest
+   upstream version (sortable columns, a policy verdict per package, and -
+   for admins - a Revoke button). "Refresh package catalog" shows live
+   progress and fetches latest versions from Ubuntu (noble) and Rocky 8
+   metadata. "Approve" on a package asks for confirmation and records an
+   approval. The left nav adds: Approvals (fleet-wide requests), Rings
+   (promote a release dev -> staging -> prod), Catalog (search upstream
+   versions), Audit log (filterable operator timeline), and - for admins -
+   Policy (allowlist/default-deny) and Operators.
 
 PROVISION AN AGENT (isolated machine)
 -------------------------------------
@@ -155,8 +197,16 @@ VERIFY / MANUAL TEST
          (fleet-wide approvals live in the Approvals view)
   5. Audit log (who did what):
        tail /var/lib/airgap-server/audit.log
-  6. Roles: sign in with a viewer account to verify read-only (no Approve
-     buttons, POST /api/update returns 403).
+   6. Roles: sign in with a viewer account to verify read-only (no Approve
+      buttons, POST /api/update returns 403).
+   7. Source policy: set default-deny on (Policies view), approve an
+      unlisted package -> 403 "blocked by source policy"; add an allow rule
+      for it and the same approval succeeds.
+   8. Revocation: as admin, open a device drawer -> Revoke. The next TLS
+      connection from that agent is refused (server log:
+      "rejected connection from revoked agent <id>"); it shows in
+      /api/agents/revoked. To un-revoke, remove it from revoked.json and
+      restart the server.
 
 NETWORKING NOTES
 ----------------
@@ -176,4 +226,5 @@ KNOWN LIMITATIONS (BETA)
   - Version comparison is best-effort (distro version strings are complex);
     a few packages may show a stale "latest".
   - Enrollment token is a single shared secret.
+  - Auth sessions are in-memory (expire on server restart).
   - SELinux left Permissive in the lab; needs a hardening pass for prod.

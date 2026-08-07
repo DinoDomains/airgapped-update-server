@@ -1,6 +1,7 @@
 use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::FromRequestParts;
@@ -11,6 +12,8 @@ use hyper::body::Incoming;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tower::Service;
+
+use crate::store::Store;
 
 /// Identity extracted from the client certificate on the TLS layer and
 /// injected into each request handled on that connection.
@@ -61,10 +64,13 @@ fn cert_cn(cert_der: &rustls::pki_types::CertificateDer<'_>) -> Option<String> {
 
 /// Runs an HTTPS accept loop that terminates mTLS and dispatches requests to
 /// the axum router. The peer certificate CN is attached to every request.
+/// Connections from agents on the revocation list are dropped before any
+/// request is served.
 pub async fn serve(
     addr: std::net::SocketAddr,
     tls: TlsAcceptor,
     router: Router,
+    store: Arc<Store>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(addr).await?;
     tracing::info!("airgap server listening on {addr} (mTLS)");
@@ -73,6 +79,7 @@ pub async fn serve(
         let peer_ip = peer.ip().to_string();
         let tls = tls.clone();
         let router = router.clone();
+        let store = store.clone();
         tokio::spawn(async move {
             let Ok(tls_stream) = tls.accept(stream).await else {
                 return;
@@ -84,8 +91,12 @@ pub async fn serve(
             if let Some(certs) = tls_stream.get_ref().1.peer_certificates() {
                 if let Some(c) = certs.first() {
                     if let Some(cn) = cert_cn(c) {
-                        identity.cn = Some(cn);
+                        identity.cn = Some(cn.clone());
                         identity.authenticated = true;
+                        if store.is_revoked(&cn).await {
+                            tracing::warn!("rejected connection from revoked agent {cn}");
+                            return;
+                        }
                     }
                 }
             }
