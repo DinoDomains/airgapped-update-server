@@ -12,7 +12,7 @@ use tokio::net::TcpListener;
 use crate::audit::AuditLog;
 use crate::auth::{Auth, Session};
 use crate::catalog::{Catalog, LatestPackage};
-use crate::store::{AgentRecord, Policy, Store, UpdateRequest};
+use crate::store::{AgentRecord, Policy, Source, Store, UpdateRequest};
 
 #[derive(Clone)]
 pub struct HttpState {
@@ -33,6 +33,10 @@ pub async fn serve(
 
 fn err(status: StatusCode, msg: &str) -> Response {
     (status, Json(serde_json::json!({ "error": msg }))).into_response()
+}
+
+fn sanitize_str(s: &str, max: usize) -> String {
+    s.chars().filter(|c| !c.is_control()).take(max).collect()
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<String> {
@@ -93,6 +97,7 @@ struct DeviceSummary {
     status: String,
     packages: usize,
     updates_available: usize,
+    scan_requested: Option<String>,
 }
 
 fn summarize(r: AgentRecord, catalog: &HashMap<String, LatestPackage>) -> DeviceSummary {
@@ -122,6 +127,7 @@ fn summarize(r: AgentRecord, catalog: &HashMap<String, LatestPackage>) -> Device
         status: r.status,
         packages: inv.map(|i| i.packages.len()).unwrap_or(0),
         updates_available,
+        scan_requested: r.scan_requested,
     }
 }
 
@@ -215,8 +221,9 @@ pub async fn refresh_catalog(State(st): State<HttpState>, headers: HeaderMap) ->
         Ok(s) => s,
         Err(r) => return r,
     };
-    let client = crate::catalog::build_client();
-    match st.catalog.sync(&client).await {
+    let sources = st.store.enabled_sources().await;
+    let client = crate::catalog::build_client(&sources);
+    match st.catalog.sync(&client, &sources).await {
         Ok(report) => {
             st.audit
                 .log(&session.operator, "catalog_refresh", "upstream", "ok");
@@ -561,6 +568,112 @@ fn policy_allows_local(p: &Policy, name: &str) -> bool {
     }
 }
 
+pub async fn scan_device(
+    State(st): State<HttpState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let session = match require_role(&st, &headers, crate::auth::ROLE_APPROVER).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match st.store.request_scan(&id).await {
+        true => {
+            st.audit.log(&session.operator, "scan_request", &id, "ok");
+            Json(serde_json::json!({ "ok": true })).into_response()
+        }
+        false => err(StatusCode::NOT_FOUND, "device not found"),
+    }
+}
+
+pub async fn list_sources(State(st): State<HttpState>, headers: HeaderMap) -> Response {
+    let _session = match current_user(&st, &headers).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    Json(st.store.list_sources().await).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct SourceBody {
+    pub name: String,
+    pub family: String,
+    pub kind: String,
+    pub base_url: String,
+    pub suite: Option<String>,
+}
+
+pub async fn add_source(
+    State(st): State<HttpState>,
+    headers: HeaderMap,
+    Json(b): Json<SourceBody>,
+) -> Response {
+    let session = match require_role(&st, &headers, crate::auth::ROLE_ADMIN).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    if b.name.trim().is_empty() || b.base_url.trim().is_empty() {
+        return err(StatusCode::BAD_REQUEST, "name and base_url are required");
+    }
+    if !matches!(b.kind.as_str(), "apt" | "dnf" | "none") {
+        return err(StatusCode::BAD_REQUEST, "kind must be 'apt', 'dnf' or 'none'");
+    }
+    let source = Source {
+        name: sanitize_str(&b.name, 100),
+        family: sanitize_str(&b.family, 50),
+        kind: b.kind.clone(),
+        base_url: sanitize_str(&b.base_url, 500),
+        suite: sanitize_str(b.suite.as_deref().unwrap_or(""), 100),
+        enabled: true,
+    };
+    st.store.upsert_source(source).await;
+    st.audit
+        .log(&session.operator, "source_add", &b.name, &b.kind);
+    Json(serde_json::json!({ "ok": true })).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct SourceToggleBody {
+    pub enabled: bool,
+}
+
+pub async fn toggle_source(
+    State(st): State<HttpState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    Json(b): Json<SourceToggleBody>,
+) -> Response {
+    let session = match require_role(&st, &headers, crate::auth::ROLE_ADMIN).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match st.store.set_source_enabled(&name, b.enabled).await {
+        true => {
+            st.audit.log(&session.operator, "source_toggle", &name, &format!("{}", b.enabled));
+            Json(serde_json::json!({ "ok": true })).into_response()
+        }
+        false => err(StatusCode::NOT_FOUND, "source not found"),
+    }
+}
+
+pub async fn delete_source(
+    State(st): State<HttpState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let session = match require_role(&st, &headers, crate::auth::ROLE_ADMIN).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match st.store.delete_source(&name).await {
+        true => {
+            st.audit.log(&session.operator, "source_delete", &name, "ok");
+            Json(serde_json::json!({ "ok": true })).into_response()
+        }
+        false => err(StatusCode::NOT_FOUND, "source not found"),
+    }
+}
+
 #[derive(Deserialize)]
 pub struct UpdateBody {
     pub agent_id: String,
@@ -769,6 +882,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       <button data-view="catalog" onclick="showView('catalog')">Catalog<small>upstream package versions</small></button>
       <button data-view="audit" onclick="showView('audit')">Audit log<small>who did what</small></button>
       <button data-view="policy" id="navPolicy" style="display:none" onclick="showView('policy')">Policy<small>allowlist / default-deny (admin)</small></button>
+      <button data-view="sources" id="navSources" style="display:none" onclick="showView('sources')">Sources<small>whitelisted upstreams (admin)</small></button>
       <button data-view="operators" id="navOperators" style="display:none" onclick="showView('operators')">Operators<small>accounts &amp; roles (admin)</small></button>
     </nav>
 
@@ -780,6 +894,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       <div class="toolbar">
         <button onclick="refreshCatalog()" id="refreshBtn">Refresh package catalog</button>
         <button class="ghost" onclick="loadDevices()">Refresh devices</button>
+        <button class="ghost" onclick="scanAll()">Scan all devices</button>
       </div>
       <div id="syncPanel">
         <b>Syncing package catalog from upstream&hellip;</b>
@@ -832,7 +947,9 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
           <option>login</option><option>approve_update</option><option>ring_promote</option>
           <option>catalog_refresh</option><option>operator_create</option><option>operator_delete</option>
           <option>policy_set</option><option>policy_entry</option><option>policy_entry_delete</option>
-          <option>agent_revoke</option><option>enroll</option><option>register</option>
+          <option>agent_revoke</option><option>scan_request</option>
+          <option>source_add</option><option>source_toggle</option><option>source_delete</option>
+          <option>enroll</option><option>register</option>
         </select>
       </div>
       <div class="empty" id="auditEmpty" style="display:none">No audit entries yet.</div>
@@ -879,6 +996,36 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
           <select id="polAction"><option value="deny">deny</option><option value="allow">allow</option></select>
           <button onclick="addPolicy()">Add rule</button>
         </div>
+      </div>
+    </div>
+
+    <div class="view" id="viewSources">
+      <div class="headline"><h2>Upstream sources</h2><span class="muted">whitelist where the catalog may download from; only enabled sources are synced</span></div>
+      <div class="empty" id="srcEmpty" style="display:none">No sources configured. Add at least one apt or dnf source so the catalog sync has something to fetch.</div>
+      <table style="margin-top:12px">
+        <thead><tr><th>Name</th><th>Family</th><th>Kind</th><th>Base URL</th><th>Suite</th><th>Status</th><th></th></tr></thead>
+        <tbody id="srcBody"></tbody>
+      </table>
+      <div class="card" style="margin-top:16px;cursor:default">
+        <h3 style="margin:0 0 10px;font-size:14px">Add / update source</h3>
+        <div class="toolbar" style="margin:0">
+          <input id="srcName" placeholder="name, e.g. windows-wsus">
+          <select id="srcFamily">
+            <option value="debian">debian</option>
+            <option value="rhel">rhel</option>
+            <option value="windows">windows</option>
+            <option value="other">other</option>
+          </select>
+          <select id="srcKind">
+            <option value="apt">apt</option>
+            <option value="dnf">dnf</option>
+            <option value="none">none (stored only)</option>
+          </select>
+          <input id="srcUrl" placeholder="base URL, e.g. http://host/repo" style="flex:1;min-width:240px">
+          <input id="srcSuite" placeholder="suite (apt only, e.g. noble)">
+          <button onclick="addSource()">Save source</button>
+        </div>
+        <p class="muted" style="margin:8px 0 0;font-size:11px">apt sources need the base URL + suite (components main/universe, arch amd64). dnf sources need the base URL of the repo dir. "none" lets you whitelist a future source (e.g. a Windows/WSUS mirror) without syncing it yet.</p>
       </div>
     </div>
   </div>
@@ -984,6 +1131,7 @@ function enterApp(op, r){
   $('#roleBadge').textContent = r;
   $('#navOperators').style.display = r === 'admin' ? 'block' : 'none';
   $('#navPolicy').style.display = r === 'admin' ? 'block' : 'none';
+  $('#navSources').style.display = r === 'admin' ? 'block' : 'none';
   $('#user').value=''; $('#pass').value='';
 }
 
@@ -1005,6 +1153,7 @@ function showView(v){
   if(v==='audit'){ loadAudit(); }
   if(v==='operators'){ loadOperators(); }
   if(v==='policy'){ loadPolicy(); }
+  if(v==='sources'){ loadSources(); }
 }
 
 async function boot(){
@@ -1054,9 +1203,14 @@ async function loadDevices(){
         </div>
         <div class="badges">
           ${statusPill(d.status)}
+          ${d.scan_requested?'<span class="badge bg-upd">scan pending</span>':''}
           ${d.updates_available>0
             ? '<span class="badge bg-upd">'+d.updates_available+' update'+(d.updates_available===1?'':'s')+' available</span>'
             : '<span class="badge bg-idle">up to date</span>'}
+        </div>
+        <div style="display:flex;gap:8px;margin-top:12px">
+          <button class="ghost" style="flex:1" onclick="event.stopPropagation();scanDevice('${esc(d.id)}')">Scan for updates</button>
+          <button class="ghost" style="flex:1" onclick="event.stopPropagation();openDrawer('${esc(d.id)}')">View packages</button>
         </div>
       </div>`).join('');
   }catch(e){ toast('Failed to load devices: '+e.message, 'err'); }
@@ -1344,6 +1498,78 @@ async function delPolicy(name){
     await api('/api/policy/entries/'+encodeURIComponent(name), {method:'DELETE'});
     toast('Rule deleted: '+name, 'ok');
     loadPolicy(); loadDevices();
+  }catch(e){ toast('Delete failed: '+e.message, 'err'); }
+}
+
+async function scanDevice(id){
+  try{
+    await api('/api/devices/'+encodeURIComponent(id)+'/scan', {method:'POST'});
+    toast('Scan requested for '+id+' - the agent will re-check on its next poll (within ~1 min)', 'ok');
+    loadDevices();
+  }catch(e){ toast('Scan failed: '+e.message, 'err'); }
+}
+
+async function scanAll(){
+  const devs = await api('/api/devices');
+  if(!devs.length){ toast('No devices enrolled yet', 'err'); return; }
+  let ok = 0, fail = 0;
+  for(const d of devs){
+    try{ await api('/api/devices/'+encodeURIComponent(d.id)+'/scan', {method:'POST'}); ok++; }
+    catch(_){ fail++; }
+  }
+  toast('Scan requested for '+ok+' device'+(ok===1?'':'s')+(fail?', '+fail+' failed':''), ok?'ok':'err');
+  loadDevices();
+}
+
+async function loadSources(){
+  try{
+    const srcs = await api('/api/sources');
+    $('#srcEmpty').style.display = srcs.length ? 'none' : 'block';
+    $('#srcBody').innerHTML = srcs.map(s=>`
+      <tr>
+        <td><b>${esc(s.name)}</b></td>
+        <td>${esc(s.family)}</td>
+        <td><span class="badge bg-idle">${esc(s.kind)}</span></td>
+        <td class="mut" style="word-break:break-all">${esc(s.base_url)}</td>
+        <td class="mut">${esc(s.suite)||'&ndash;'}</td>
+        <td>${s.enabled?'<span class="badge bg-online">enabled</span>':'<span class="badge bg-idle">disabled</span>'}</td>
+        <td style="white-space:nowrap">
+          <button class="ghost" onclick="toggleSource('${esc(s.name)}', ${!s.enabled})">${s.enabled?'Disable':'Enable'}</button>
+          <button class="ghost" onclick="delSource('${esc(s.name)}')">Delete</button>
+        </td>
+      </tr>`).join('');
+  }catch(e){ toast('Failed to load sources: '+e.message, 'err'); }
+}
+
+async function addSource(){
+  const name = $('#srcName').value.trim();
+  const url = $('#srcUrl').value.trim();
+  const family = $('#srcFamily').value;
+  const kind = $('#srcKind').value;
+  const suite = $('#srcSuite').value.trim();
+  if(!name || !url){ toast('Name and base URL are required', 'err'); return; }
+  try{
+    await api('/api/sources', {method:'POST', body: JSON.stringify({name, family, kind, base_url: url, suite})});
+    toast('Source '+name+' saved', 'ok');
+    $('#srcName').value=''; $('#srcUrl').value=''; $('#srcSuite').value='';
+    loadSources();
+  }catch(e){ toast('Save failed: '+e.message, 'err'); }
+}
+
+async function toggleSource(name, enabled){
+  try{
+    await api('/api/sources/'+encodeURIComponent(name), {method:'POST', body: JSON.stringify({enabled})});
+    toast(name+' '+(enabled?'enabled':'disabled'), 'ok');
+    loadSources();
+  }catch(e){ toast('Update failed: '+e.message, 'err'); }
+}
+
+async function delSource(name){
+  if(!confirm('Delete source '+name+'?')) return;
+  try{
+    await api('/api/sources/'+encodeURIComponent(name), {method:'DELETE'});
+    toast('Source '+name+' deleted', 'ok');
+    loadSources();
   }catch(e){ toast('Delete failed: '+e.message, 'err'); }
 }
 

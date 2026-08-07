@@ -87,6 +87,8 @@ pub struct UpdateItem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PollResponse {
     pub updates: Vec<UpdateItem>,
+    #[serde(default)]
+    pub scan_requested: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

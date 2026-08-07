@@ -95,6 +95,12 @@ RUN THE SERVER (on the machine that will be the update server)
     GET  /api/devices             all devices + per-device update counts
     GET  /api/devices/<id>/packages   per-device installed vs latest (incl.
                                       policy verdict per package)
+    POST /api/devices/<id>/scan   request a fresh scan of that device (the
+                                  agent re-checks on its next poll; approver+)
+    GET  /api/sources             whitelisted upstream sources (any signed-in)
+    POST /api/sources             add/update a source (admin only)
+    POST /api/sources/<name>      enable/disable a source (admin only)
+    DELETE /api/sources/<name>    remove a source (admin only)
     POST /api/refresh             sync upstream apt/dnf metadata (catalog)
     GET  /api/refresh/status      live sync progress (phase/elapsed)
     POST /api/update              {"agent_id":..,"package":..} -> approval
@@ -131,6 +137,21 @@ RUN THE SERVER (on the machine that will be the update server)
   the default rule and individual entries; the device drawer shows a
   "blocked" chip on packages that are denied.
 
+  Upstream sources (the "whitelist of places updates may be downloaded
+  from"): stored in <AIRGAP_STORE_DIR>/sources.json and managed from the
+  dashboard Sources view (admin). Each source has a name, family (debian,
+  rhel, windows, other), kind (apt, dnf, none), base URL and - for apt - a
+  suite. Only ENABLED sources are used by the catalog sync; "none" stores a
+  source without syncing (e.g. a future Windows/WSUS mirror). On first boot
+  the server seeds the Ubuntu noble + Rocky 8 mirrors. The catalog sync
+  refuses to run if no enabled apt/dnf source exists.
+
+  Scanning devices: a dashboard "Scan for updates" button (or "Scan all
+  devices") marks a device for a fresh scan. The agent picks this up on its
+  next poll (~1 minute), re-collects and re-reports its inventory, and the
+  server clears the flag (the card shows "scan pending" meanwhile). Scans
+  are recorded in the audit log.
+
   First boot creates the operator "admin" with password from the
   AIRGAP_ADMIN_PASSWORD environment variable (default: "admin" - change it!).
   The operator list is stored (argon2-hashed) in <AIRGAP_STORE_DIR>/operators.json.
@@ -150,11 +171,13 @@ RUN THE SERVER (on the machine that will be the update server)
    upstream version (sortable columns, a policy verdict per package, and -
    for admins - a Revoke button). "Refresh package catalog" shows live
    progress and fetches latest versions from Ubuntu (noble) and Rocky 8
-   metadata. "Approve" on a package asks for confirmation and records an
+   metadata.    "Approve" on a package asks for confirmation and records an
    approval. The left nav adds: Approvals (fleet-wide requests), Rings
    (promote a release dev -> staging -> prod), Catalog (search upstream
    versions), Audit log (filterable operator timeline), and - for admins -
-   Policy (allowlist/default-deny) and Operators.
+   Policy (allowlist/default-deny), Sources (whitelisted upstream mirrors)
+   and Operators. Each device card has a "Scan for updates" button that
+   asks that agent to re-check its packages on the next poll.
 
 PROVISION AN AGENT (isolated machine)
 -------------------------------------
@@ -169,13 +192,16 @@ PROVISION AN AGENT (isolated machine)
         /usr/local/bin/airgap-agent
 
   The agent enrolls, saves client.pem / client-key.pem (0600) and agent-id,
-  registers, reports inventory, and polls for updates. Subsequent runs reuse
-  the client certificate (no token needed).
+  registers, reports inventory, then enters a poll loop: every
+  AIRGAP_POLL_INTERVAL seconds (default 60) it asks the server for updates
+  and honours any pending scan request by re-collecting and re-reporting its
+  inventory. Set AIRGAP_POLL_INTERVAL=0 to run once and exit (cron-style).
 
   Environment variables (agent):
     AIRGAP_SERVER    server base URL   DEFAULT: https://172.16.5.20:8443
     AIRGAP_STATE_DIR state directory   DEFAULT: /var/lib/airgap-agent
     AIRGAP_ENROLL_TOKEN                only needed on first enroll
+    AIRGAP_POLL_INTERVAL seconds between polls   DEFAULT: 60 (0 = one-shot)
 
 VERIFY / MANUAL TEST
 --------------------

@@ -13,6 +13,8 @@ pub struct AgentRecord {
     pub last_seen: Option<String>,
     pub status: String,
     pub ip: Option<String>,
+    #[serde(default)]
+    pub scan_requested: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +59,70 @@ pub struct Policy {
     pub entries: HashMap<String, PolicyEntry>,
 }
 
+/// A whitelisted upstream source that the catalog may sync from.
+/// `kind` is "apt", "dnf" or "none" (the latter stores a source without
+/// syncing, e.g. a future Windows/WSUS mirror). `suite` is used by apt only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Source {
+    pub name: String,
+    pub family: String,
+    pub kind: String,
+    pub base_url: String,
+    #[serde(default)]
+    pub suite: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_sources() -> Vec<Source> {
+    vec![
+        Source {
+            name: "ubuntu-noble".to_string(),
+            family: "debian".to_string(),
+            kind: "apt".to_string(),
+            base_url: "http://archive.ubuntu.com/ubuntu".to_string(),
+            suite: "noble".to_string(),
+            enabled: true,
+        },
+        Source {
+            name: "ubuntu-noble-updates".to_string(),
+            family: "debian".to_string(),
+            kind: "apt".to_string(),
+            base_url: "http://archive.ubuntu.com/ubuntu".to_string(),
+            suite: "noble-updates".to_string(),
+            enabled: true,
+        },
+        Source {
+            name: "ubuntu-noble-security".to_string(),
+            family: "debian".to_string(),
+            kind: "apt".to_string(),
+            base_url: "http://security.ubuntu.com/ubuntu".to_string(),
+            suite: "noble-security".to_string(),
+            enabled: true,
+        },
+        Source {
+            name: "rocky8-baseos".to_string(),
+            family: "rhel".to_string(),
+            kind: "dnf".to_string(),
+            base_url: "http://mirror.rackspace.com/rocky/8/BaseOS/x86_64/os".to_string(),
+            suite: String::new(),
+            enabled: true,
+        },
+        Source {
+            name: "rocky8-appstream".to_string(),
+            family: "rhel".to_string(),
+            kind: "dnf".to_string(),
+            base_url: "http://mirror.rackspace.com/rocky/8/AppStream/x86_64/os".to_string(),
+            suite: String::new(),
+            enabled: true,
+        },
+    ]
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Catalog {
     pub updates: Vec<UpdateItem>,
@@ -71,6 +137,7 @@ struct State {
     updates: Vec<UpdateRequest>,
     revoked: HashMap<String, RevokedRecord>,
     policy: Policy,
+    sources: Vec<Source>,
 }
 
 pub struct Store {
@@ -109,6 +176,15 @@ impl Store {
             let tokens = state.tokens.clone();
             drop(state);
             store.write_json("tokens.json", &tokens).await;
+        }
+        {
+            let mut state = store.state.write().await;
+            if state.sources.is_empty() {
+                state.sources = default_sources();
+            }
+            let sources = state.sources.clone();
+            drop(state);
+            store.write_json("sources.json", &sources).await;
         }
         Ok(store)
     }
@@ -285,6 +361,92 @@ impl Store {
         drop(state);
         if removed {
             self.write_json("policy.json", &snap).await;
+        }
+        removed
+    }
+
+    /// Marks an agent for a fresh scan. The agent picks this up on its next
+    /// poll and re-reports inventory, which clears the flag.
+    pub async fn request_scan(&self, agent_id: &str) -> bool {
+        let mut state = self.state.write().await;
+        let Some(agent) = state.agents.get_mut(agent_id) else {
+            return false;
+        };
+        agent.scan_requested = Some(now_iso());
+        let snap = state.agents.clone();
+        drop(state);
+        self.write_json("agents.json", &snap).await;
+        true
+    }
+
+    pub async fn scan_pending(&self, agent_id: &str) -> bool {
+        self.state
+            .read()
+            .await
+            .agents
+            .get(agent_id)
+            .and_then(|a| a.scan_requested.as_ref())
+            .is_some()
+    }
+
+    pub async fn clear_scan(&self, agent_id: &str) {
+        let mut state = self.state.write().await;
+        if let Some(agent) = state.agents.get_mut(agent_id) {
+            agent.scan_requested = None;
+        }
+        let snap = state.agents.clone();
+        drop(state);
+        self.write_json("agents.json", &snap).await;
+    }
+
+    pub async fn list_sources(&self) -> Vec<Source> {
+        self.state.read().await.sources.clone()
+    }
+
+    pub async fn enabled_sources(&self) -> Vec<Source> {
+        self.state
+            .read()
+            .await
+            .sources
+            .iter()
+            .filter(|s| s.enabled)
+            .cloned()
+            .collect()
+    }
+
+    pub async fn upsert_source(&self, source: Source) {
+        let mut state = self.state.write().await;
+        if let Some(existing) = state.sources.iter_mut().find(|s| s.name == source.name) {
+            *existing = source;
+        } else {
+            state.sources.push(source);
+        }
+        let snap = state.sources.clone();
+        drop(state);
+        self.write_json("sources.json", &snap).await;
+    }
+
+    pub async fn set_source_enabled(&self, name: &str, enabled: bool) -> bool {
+        let mut state = self.state.write().await;
+        let Some(source) = state.sources.iter_mut().find(|s| s.name == name) else {
+            return false;
+        };
+        source.enabled = enabled;
+        let snap = state.sources.clone();
+        drop(state);
+        self.write_json("sources.json", &snap).await;
+        true
+    }
+
+    pub async fn delete_source(&self, name: &str) -> bool {
+        let mut state = self.state.write().await;
+        let before = state.sources.len();
+        state.sources.retain(|s| s.name != name);
+        let removed = state.sources.len() != before;
+        let snap = state.sources.clone();
+        drop(state);
+        if removed {
+            self.write_json("sources.json", &snap).await;
         }
         removed
     }

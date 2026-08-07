@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use crate::store::Source;
 use airgap_proto::DistroFamily;
 use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
@@ -58,26 +59,18 @@ pub struct SyncReport {
     pub dnf: usize,
 }
 
-const APT_HOSTS: &[(&str, &[&str])] = &[
-    ("http://archive.ubuntu.com/ubuntu", &["noble", "noble-updates"]),
-    ("http://security.ubuntu.com/ubuntu", &["noble-security"]),
-];
 const APT_COMPONENTS: &[&str] = &["main", "universe"];
 const APT_ARCH: &str = "amd64";
 
-const DNF_REPOS: &[(&str, &str)] = &[
-    ("baseos", "http://mirror.rackspace.com/rocky/8/BaseOS/x86_64/os"),
-    ("appstream", "http://mirror.rackspace.com/rocky/8/AppStream/x86_64/os"),
-];
-
-/// Builds a client that resolves every upstream host to IPv4 only. Some
-/// mirrors (dl.rockylinux.org) advertise AAAA records but the air-gapped
-/// server has no IPv6 route; without pinning, reqwest can stall on IPv6.
-pub fn build_client() -> reqwest::Client {
+/// Builds a client that resolves every whitelisted upstream host to IPv4
+/// only. Some mirrors (dl.rockylinux.org) advertise AAAA records but the
+/// air-gapped server has no IPv6 route; without pinning, reqwest can stall
+/// on IPv6.
+pub fn build_client(sources: &[Source]) -> reqwest::Client {
     use std::net::ToSocketAddrs;
     let mut builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(90));
-    for host in upstream_hosts() {
+    for host in upstream_hosts(sources) {
         if let Ok(addr) = format!("{host}:80").to_socket_addrs() {
             if let Some(a) = addr.filter(|a| a.is_ipv4()).next() {
                 builder = builder.resolve(&host, a);
@@ -87,19 +80,16 @@ pub fn build_client() -> reqwest::Client {
     builder.build().expect("failed to build http client")
 }
 
-fn upstream_hosts() -> Vec<String> {
+fn upstream_hosts(sources: &[Source]) -> Vec<String> {
     let mut hosts = Vec::new();
-    for (host, _) in APT_HOSTS {
-        if let Some(rest) = host.strip_prefix("http://") {
-            if let Some(h) = rest.split('/').next() {
-                hosts.push(h.to_string());
-            }
-        }
-    }
-    for (_, base) in DNF_REPOS {
-        if let Some(rest) = base.strip_prefix("http://") {
-            if let Some(h) = rest.split('/').next() {
-                hosts.push(h.to_string());
+    for s in sources {
+        let base = s.base_url.trim_end_matches('/');
+        let rest = base.strip_prefix("http://").or_else(|| base.strip_prefix("https://"));
+        if let Some(h) = rest {
+            if let Some(host) = h.split('/').next() {
+                if !hosts.iter().any(|x| x == host) {
+                    hosts.push(host.to_string());
+                }
             }
         }
     }
@@ -143,7 +133,11 @@ impl Catalog {
             .cloned()
     }
 
-    pub async fn sync(&self, client: &reqwest::Client) -> Result<SyncReport, String> {
+    pub async fn sync(
+        &self,
+        client: &reqwest::Client,
+        sources: &[Source],
+    ) -> Result<SyncReport, String> {
         let mut guard = self.syncing.lock().await;
         if *guard {
             return Err("sync already in progress".to_string());
@@ -155,7 +149,7 @@ impl Catalog {
             st.started = Some(now_secs());
             st.phase = "starting".to_string();
         }
-        let result = self.do_sync(client).await;
+        let result = self.do_sync(client, sources).await;
         {
             let mut st = self.status.write().await;
             st.syncing = false;
@@ -176,49 +170,64 @@ impl Catalog {
         self.status.write().await.phase = phase.to_string();
     }
 
-    async fn do_sync(&self, client: &reqwest::Client) -> Result<SyncReport, String> {
+    async fn do_sync(
+        &self,
+        client: &reqwest::Client,
+        sources: &[Source],
+    ) -> Result<SyncReport, String> {
         let mut merged: HashMap<String, LatestPackage> = HashMap::new();
         let mut apt_count = 0usize;
         let mut dnf_count = 0usize;
 
+        let apt_sources: Vec<&Source> = sources.iter().filter(|s| s.kind == "apt").collect();
+        let dnf_sources: Vec<&Source> = sources.iter().filter(|s| s.kind == "dnf").collect();
+        if apt_sources.is_empty() && dnf_sources.is_empty() {
+            return Err("no enabled upstream sources; whitelist at least one in the Sources view".to_string());
+        }
+
         self.set_phase("fetching apt metadata").await;
-        for (host, suites) in APT_HOSTS {
-            for suite in *suites {
-                for comp in APT_COMPONENTS {
-                    let url = format!(
-                        "{host}/dists/{suite}/{comp}/binary-{}/Packages.gz",
-                        APT_ARCH
-                    );
-                    tracing::info!("syncing apt: {url}");
-                    let bytes = fetch(client, &url).await?;
-                    let parsed = parse_packages_gz(&bytes).map_err(|e| e.to_string())?;
-                    for para in parsed {
-                        let name = para.get("Package").cloned().unwrap_or_default();
-                        let version = para.get("Version").cloned().unwrap_or_default();
-                        let arch = para.get("Architecture").cloned().unwrap_or_default();
-                        if name.is_empty() || version.is_empty() {
-                            continue;
-                        }
-                        insert_latest(
-                            &mut merged,
-                            name,
-                            version,
-                            DistroFamily::Debian,
-                            format!("{suite}/{comp}"),
-                            arch,
-                        );
-                        apt_count += 1;
+        for src in &apt_sources {
+            if src.suite.is_empty() {
+                continue;
+            }
+            for comp in APT_COMPONENTS {
+                let url = format!(
+                    "{}/dists/{}/{}/binary-{}/Packages.gz",
+                    src.base_url.trim_end_matches('/'),
+                    src.suite,
+                    comp,
+                    APT_ARCH
+                );
+                tracing::info!("syncing apt: {url}");
+                let bytes = fetch(client, &url).await?;
+                let parsed = parse_packages_gz(&bytes).map_err(|e| e.to_string())?;
+                for para in parsed {
+                    let name = para.get("Package").cloned().unwrap_or_default();
+                    let version = para.get("Version").cloned().unwrap_or_default();
+                    let arch = para.get("Architecture").cloned().unwrap_or_default();
+                    if name.is_empty() || version.is_empty() {
+                        continue;
                     }
+                    insert_latest(
+                        &mut merged,
+                        name,
+                        version,
+                        DistroFamily::Debian,
+                        format!("{}/{}", src.suite, comp),
+                        arch,
+                    );
+                    apt_count += 1;
                 }
             }
         }
 
         self.set_phase("fetching dnf metadata").await;
-        for (repo, base) in DNF_REPOS {
+        for src in &dnf_sources {
+            let base = src.base_url.trim_end_matches('/').to_string();
             tracing::info!("syncing dnf: {base}");
             let repomd = fetch(client, &format!("{base}/repodata/repomd.xml")).await?;
             let primary_rel = primary_location(&repomd).ok_or_else(|| {
-                format!("no primary metadata found in repomd.xml for {repo}")
+                format!("no primary metadata found in repomd.xml for {}", src.name)
             })?;
             let primary = fetch(client, &format!("{base}/{primary_rel}")).await?;
             let pkgs = parse_primary_gz(&primary).map_err(|e| e.to_string())?;
@@ -228,7 +237,7 @@ impl Catalog {
                     p.0,
                     p.1,
                     DistroFamily::Rhel,
-                    repo.to_string(),
+                    src.name.clone(),
                     p.2,
                 );
                 dnf_count += 1;

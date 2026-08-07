@@ -103,6 +103,11 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/catalog", get(http::search_catalog))
         .route("/api/agents/:id/revoke", post(http::revoke_agent))
         .route("/api/agents/revoked", get(http::list_revoked))
+        .route("/api/devices/:id/scan", post(http::scan_device))
+        .route("/api/sources", get(http::list_sources))
+        .route("/api/sources", post(http::add_source))
+        .route("/api/sources/:name", post(http::toggle_source))
+        .route("/api/sources/:name", delete(http::delete_source))
         .with_state(http_state);
     let http_task = http::serve(http_listen, http_app);
 

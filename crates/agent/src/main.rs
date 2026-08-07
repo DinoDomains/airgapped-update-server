@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use airgap_proto::{InventoryRequest, PollRequest, RegisterRequest};
 
@@ -25,8 +26,12 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let state_dir = PathBuf::from(
         std::env::var("AIRGAP_STATE_DIR").unwrap_or_else(|_| DEFAULT_STATE_DIR.to_string()),
     );
+    let poll_interval = std::env::var("AIRGAP_POLL_INTERVAL")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(60);
 
-    let inv = inventory::collect().await;
+    let mut inv = inventory::collect().await;
     tracing::info!("collected inventory: {} {}", inv.os_name, inv.os_version);
 
     let client = client::Client::load_or_enroll(&server, &state_dir).await?;
@@ -39,16 +44,38 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     client.register(&reg).await?;
     tracing::info!("registered as {agent_id}");
 
-    let inv_req = InventoryRequest {
-        agent_id: agent_id.clone(),
-        inventory: inv,
-    };
-    client.inventory(&inv_req).await?;
+    client
+        .inventory(&InventoryRequest {
+            agent_id: agent_id.clone(),
+            inventory: inv.clone(),
+        })
+        .await?;
 
-    let poll = client.poll(&PollRequest {
-        agent_id: agent_id.clone(),
-    }).await?;
-    tracing::info!("server offered {} update(s)", poll.updates.len());
+    loop {
+        let poll = client
+            .poll(&PollRequest {
+                agent_id: agent_id.clone(),
+            })
+            .await?;
+        tracing::info!("server offered {} update(s)", poll.updates.len());
+
+        if poll.scan_requested {
+            tracing::info!("server requested a scan - re-collecting inventory");
+            inv = inventory::collect().await;
+            client
+                .inventory(&InventoryRequest {
+                    agent_id: agent_id.clone(),
+                    inventory: inv.clone(),
+                })
+                .await?;
+            tracing::info!("scan complete - inventory re-reported");
+        }
+
+        if poll_interval == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(poll_interval)).await;
+    }
 
     Ok(())
 }

@@ -107,6 +107,7 @@ pub async fn enroll(
                 last_seen: None,
                 status: "enrolled".to_string(),
                 ip: identity.peer,
+                scan_requested: None,
             };
             st.store.register_agent(record).await;
             Json(resp).into_response()
@@ -137,6 +138,7 @@ pub async fn register(
         last_seen: Some(now_ts()),
         status: "registered".to_string(),
         ip: identity.peer,
+        scan_requested: None,
     };
     st.store.register_agent(record).await;
     tracing::info!("agent registered: {cn}");
@@ -167,20 +169,29 @@ pub async fn inventory(
     if !ok {
         return err(StatusCode::NOT_FOUND, "agent not registered");
     }
+    st.store.clear_scan(&cn).await;
     Json(InventoryResponse { accepted: true }).into_response()
 }
 
 pub async fn poll(
     State(st): State<ApiState>,
     identity: ClientIdentity,
-    Json(_req): Json<PollRequest>,
+    Json(req): Json<PollRequest>,
 ) -> Response {
-    let _cn = match require_auth(&identity) {
+    let cn = match require_auth(&identity) {
         Ok(cn) => cn,
         Err(r) => return r,
     };
+    if cn != req.agent_id {
+        return err(StatusCode::FORBIDDEN, "agent_id does not match certificate");
+    }
     let updates = st.store.pending_updates().await;
-    Json(PollResponse { updates }).into_response()
+    let scan_requested = st.store.scan_pending(&cn).await;
+    Json(PollResponse {
+        updates,
+        scan_requested,
+    })
+    .into_response()
 }
 
 pub async fn health(State(st): State<ApiState>) -> Response {
