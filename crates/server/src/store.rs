@@ -33,6 +33,8 @@ pub struct UpdateRequest {
     pub ring: String,
     pub ts: String,
     pub status: String,
+    #[serde(default)]
+    pub approved_by: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

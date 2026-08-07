@@ -3,13 +3,14 @@ use std::sync::Arc;
 
 use airgap_proto::OsInventory;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
 use crate::audit::AuditLog;
+use crate::auth::{Auth, Session};
 use crate::catalog::{Catalog, LatestPackage};
 use crate::store::{AgentRecord, Store, UpdateRequest};
 
@@ -18,6 +19,7 @@ pub struct HttpState {
     pub store: Arc<Store>,
     pub catalog: Arc<Catalog>,
     pub audit: Arc<AuditLog>,
+    pub auth: Arc<Auth>,
 }
 
 pub async fn serve(
@@ -31,6 +33,35 @@ pub async fn serve(
 
 fn err(status: StatusCode, msg: &str) -> Response {
     (status, Json(serde_json::json!({ "error": msg }))).into_response()
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|s| s.to_string())
+}
+
+async fn current_user(st: &HttpState, headers: &HeaderMap) -> Result<Session, Response> {
+    let token = bearer_token(headers)
+        .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "login required"))?;
+    st.auth
+        .session(&token)
+        .await
+        .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "invalid or expired session"))
+}
+
+async fn require_role(
+    st: &HttpState,
+    headers: &HeaderMap,
+    min_role: &str,
+) -> Result<Session, Response> {
+    let session = current_user(st, headers).await?;
+    if !Auth::role_allows(&session, min_role) {
+        return Err(err(StatusCode::FORBIDDEN, "insufficient role"));
+    }
+    Ok(session)
 }
 
 fn pkg_update_available(
@@ -108,7 +139,14 @@ pub async fn dashboard() -> Html<&'static str> {
     Html(DASHBOARD_HTML)
 }
 
-pub async fn devices(State(st): State<HttpState>) -> Response {
+pub async fn devices(
+    State(st): State<HttpState>,
+    headers: HeaderMap,
+) -> Response {
+    let _session = match current_user(&st, &headers).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
     let agents = st.store.list_agents().await;
     let catalog = st.catalog.snapshot().await;
     let devs: Vec<DeviceSummary> = agents
@@ -121,7 +159,12 @@ pub async fn devices(State(st): State<HttpState>) -> Response {
 pub async fn device_packages(
     State(st): State<HttpState>,
     Path(id): Path<String>,
+    headers: HeaderMap,
 ) -> Response {
+    let _session = match current_user(&st, &headers).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
     let agent = match st.store.get_agent(&id).await {
         Some(a) => a,
         None => return err(StatusCode::NOT_FOUND, "device not found"),
@@ -160,26 +203,39 @@ pub async fn device_packages(
     .into_response()
 }
 
-pub async fn refresh_catalog(State(st): State<HttpState>) -> Response {
+pub async fn refresh_catalog(State(st): State<HttpState>, headers: HeaderMap) -> Response {
+    let session = match require_role(&st, &headers, crate::auth::ROLE_APPROVER).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
     let client = crate::catalog::build_client();
     match st.catalog.sync(&client).await {
         Ok(report) => {
-            st.audit.log("operator", "catalog_refresh", "upstream", "ok");
+            st.audit
+                .log(&session.operator, "catalog_refresh", "upstream", "ok");
             Json(report).into_response()
         }
         Err(e) => {
             st.audit
-                .log("operator", "catalog_refresh", "upstream", "failed");
+                .log(&session.operator, "catalog_refresh", "upstream", "failed");
             err(StatusCode::BAD_GATEWAY, &e)
         }
     }
 }
 
-pub async fn refresh_status(State(st): State<HttpState>) -> Response {
+pub async fn refresh_status(State(st): State<HttpState>, headers: HeaderMap) -> Response {
+    let _session = match current_user(&st, &headers).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
     Json(st.catalog.status().await).into_response()
 }
 
-pub async fn health(State(st): State<HttpState>) -> Response {
+pub async fn health(State(st): State<HttpState>, headers: HeaderMap) -> Response {
+    let _session = match current_user(&st, &headers).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
     let agents = st.store.list_agents().await;
     let pending = st
         .store
@@ -200,8 +256,113 @@ pub async fn health(State(st): State<HttpState>) -> Response {
     .into_response()
 }
 
-pub async fn audit_log(State(st): State<HttpState>) -> Response {
-    Json(st.audit.recent(200)).into_response()
+pub async fn audit_log(State(st): State<HttpState>, headers: HeaderMap) -> Response {
+    let _session = match current_user(&st, &headers).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    Json(st.audit.recent(500)).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct LoginBody {
+    pub username: String,
+    pub password: String,
+}
+
+pub async fn login(State(st): State<HttpState>, Json(body): Json<LoginBody>) -> Response {
+    match st.auth.login(&body.username, &body.password).await {
+        Some(s) => {
+            st.audit.log(&s.operator, "login", "dashboard", "ok");
+            Json(serde_json::json!({
+                "token": s.token,
+                "operator": s.operator,
+                "role": s.role,
+            }))
+            .into_response()
+        }
+        None => {
+            st.audit
+                .log(&body.username, "login", "dashboard", "failed");
+            err(StatusCode::UNAUTHORIZED, "invalid credentials")
+        }
+    }
+}
+
+pub async fn logout(State(st): State<HttpState>, headers: HeaderMap) -> Response {
+    if let Some(token) = bearer_token(&headers) {
+        st.auth.logout(&token).await;
+    }
+    Json(serde_json::json!({ "ok": true })).into_response()
+}
+
+pub async fn me(State(st): State<HttpState>, headers: HeaderMap) -> Response {
+    match current_user(&st, &headers).await {
+        Ok(s) => Json(serde_json::json!({ "operator": s.operator, "role": s.role })).into_response(),
+        Err(r) => r,
+    }
+}
+
+pub async fn list_operators(State(st): State<HttpState>, headers: HeaderMap) -> Response {
+    let _session = match require_role(&st, &headers, crate::auth::ROLE_ADMIN).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    Json(st.auth.list_operators().await).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct CreateOperatorBody {
+    pub name: String,
+    pub password: String,
+    pub role: String,
+}
+
+pub async fn create_operator(
+    State(st): State<HttpState>,
+    headers: HeaderMap,
+    Json(body): Json<CreateOperatorBody>,
+) -> Response {
+    let session = match require_role(&st, &headers, crate::auth::ROLE_ADMIN).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    if body.name.trim().is_empty() || body.password.trim().is_empty() {
+        return err(StatusCode::BAD_REQUEST, "name and password are required");
+    }
+    match st
+        .auth
+        .create_operator(body.name.trim(), &body.password, &body.role)
+        .await
+    {
+        Ok(()) => {
+            st.audit
+                .log(&session.operator, "operator_create", body.name.trim(), "ok");
+            Json(serde_json::json!({ "ok": true })).into_response()
+        }
+        Err(e) => err(StatusCode::BAD_REQUEST, &e),
+    }
+}
+
+pub async fn delete_operator(
+    State(st): State<HttpState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let session = match require_role(&st, &headers, crate::auth::ROLE_ADMIN).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    if name == session.operator {
+        return err(StatusCode::BAD_REQUEST, "cannot delete your own account");
+    }
+    match st.auth.delete_operator(&name).await {
+        true => {
+            st.audit.log(&session.operator, "operator_delete", &name, "ok");
+            Json(serde_json::json!({ "ok": true })).into_response()
+        }
+        false => err(StatusCode::NOT_FOUND, "operator not found"),
+    }
 }
 
 #[derive(Deserialize)]
@@ -212,8 +373,13 @@ pub struct UpdateBody {
 
 pub async fn request_update(
     State(st): State<HttpState>,
+    headers: HeaderMap,
     Json(req): Json<UpdateBody>,
 ) -> Response {
+    let session = match require_role(&st, &headers, crate::auth::ROLE_APPROVER).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
     let agent = match st.store.get_agent(&req.agent_id).await {
         Some(a) => a,
         None => return err(StatusCode::NOT_FOUND, "device not found"),
@@ -250,10 +416,11 @@ pub async fn request_update(
         ring: "dev".to_string(),
         ts,
         status: "approved-pending".to_string(),
+        approved_by: session.operator.clone(),
     };
     st.store.record_update_request(request.clone()).await;
     st.audit.log(
-        "operator",
+        &session.operator,
         "approve_update",
         &format!("{}/{}", request.agent_id, request.package),
         "approved-pending",
@@ -262,7 +429,11 @@ pub async fn request_update(
     Json(request).into_response()
 }
 
-pub async fn pending_updates(State(st): State<HttpState>) -> Response {
+pub async fn pending_updates(State(st): State<HttpState>, headers: HeaderMap) -> Response {
+    let _session = match current_user(&st, &headers).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
     let updates = st.store.update_requests().await;
     Json(updates).into_response()
 }
@@ -301,6 +472,8 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
            font-weight:700; cursor:pointer; font-family:inherit; }
   button.ghost { background:transparent; color:var(--ac); border:1px solid var(--ac); }
   button:disabled { opacity:.5; cursor:default; }
+  input,select { background:#0b1526; border:1px solid var(--line); color:var(--txt); border-radius:6px;
+                 padding:8px 10px; font-family:inherit; font-size:13px; }
   main { padding:20px; max-width:1200px; margin:0 auto; }
   .headline { display:flex; align-items:baseline; gap:10px; }
   .headline h2 { font-size:15px; margin:0; } .muted { color:var(--mut); }
@@ -338,38 +511,122 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
   #syncPanel .bar { height:6px; background:#0b1526; border-radius:4px; overflow:hidden; margin-top:8px; }
   #syncPanel .fill { height:100%; width:0; background:var(--ac); animation:grow 60s linear forwards; }
   @keyframes grow { from { width:0; } to { width:100%; } }
-  #pendingPanel { display:none; margin-top:16px; }
   .row { display:flex; justify-content:space-between; gap:10px; padding:5px 0; border-bottom:1px dashed var(--line); font-size:12px; }
+  .layout { display:flex; gap:20px; }
+  nav { flex:0 0 170px; display:flex; flex-direction:column; gap:6px; }
+  nav button { text-align:left; background:transparent; color:var(--txt); border:1px solid transparent; font-weight:600; }
+  nav button.active { background:var(--panel); border-color:var(--line); color:var(--ac); }
+  nav button small { display:block; color:var(--mut); font-weight:400; font-size:11px; }
+  .view { flex:1; min-width:0; display:none; } .view.active { display:block; }
+  #login { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; background:var(--bg); z-index:100; }
+  #login .box { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:28px; width:340px; }
+  #login h1 { font-size:20px; margin:0 0 4px; } #login p { color:var(--mut); font-size:12px; margin:0 0 18px; }
+  #login .fld { margin-bottom:12px; } #login label { display:block; font-size:11px; color:var(--mut); margin-bottom:4px; }
+  #login input { width:100%; }
+  #login .err { color:var(--red); font-size:12px; min-height:16px; margin-top:8px; }
+  .toolbar { display:flex; gap:10px; align-items:center; margin:16px 0; flex-wrap:wrap; }
+  .timeline { display:flex; flex-direction:column; gap:8px; margin-top:12px; }
+  .evt { display:flex; gap:12px; align-items:baseline; background:var(--panel); border:1px solid var(--line);
+         border-radius:6px; padding:10px 12px; font-size:12px; }
+  .evt .t { color:var(--mut); white-space:nowrap; } .evt .a { font-weight:700; } .evt .act { color:var(--ac); }
+  .evt .tg { color:var(--mut); word-break:break-all; } .evt .r { margin-left:auto; }
 </style>
 </head>
 <body>
+<div id="login">
+  <div class="box">
+    <h1>OpenUpdater</h1>
+    <p>sign in to the update dashboard</p>
+    <div class="fld"><label>Username</label><input id="user" autocomplete="username"></div>
+    <div class="fld"><label>Password</label><input id="pass" type="password" autocomplete="current-password"></div>
+    <button style="width:100%" onclick="doLogin()">Sign in</button>
+    <div class="err" id="loginErr"></div>
+  </div>
+</div>
+
+<div id="app" style="display:none">
 <header>
   <h1>OpenUpdater</h1>
   <span class="health"><span class="dot" id="healthDot"></span><span id="healthTxt">checking&hellip;</span></span>
   <span class="srv">server: <b id="srvHost"></b></span>
   <span class="health">last catalog sync: <b id="lastSync" class="mut">never</b></span>
   <span style="flex:1"></span>
-  <button class="ghost" id="pendingBtn" onclick="togglePending()">Pending approvals <span class="badge bg-upd" id="pendingBadge">0</span></button>
-  <button onclick="refreshCatalog()" id="refreshBtn">Refresh package catalog</button>
-  <button class="ghost" onclick="loadDevices()">Refresh devices</button>
+  <span class="health">signed in: <b id="whoami"></b> <span class="badge bg-idle" id="roleBadge"></span></span>
+  <button class="ghost" onclick="doLogout()">Sign out</button>
 </header>
 <main>
-  <div class="headline">
-    <h2>Devices</h2><span class="muted" id="devCount"></span>
-    <span class="muted" style="margin-left:auto">click a device to view its packages</span>
+  <div class="layout">
+    <nav>
+      <button class="active" data-view="devices" onclick="showView('devices')">Devices<small>fleet inventory &amp; versions</small></button>
+      <button data-view="approvals" onclick="showView('approvals')">Approvals<small>pending update requests</small></button>
+      <button data-view="audit" onclick="showView('audit')">Audit log<small>who did what</small></button>
+      <button data-view="operators" id="navOperators" style="display:none" onclick="showView('operators')">Operators<small>accounts &amp; roles (admin)</small></button>
+    </nav>
+
+    <div class="view active" id="viewDevices">
+      <div class="headline">
+        <h2>Devices</h2><span class="muted" id="devCount"></span>
+        <span class="muted" style="margin-left:auto">click a device to view its packages</span>
+      </div>
+      <div class="toolbar">
+        <button onclick="refreshCatalog()" id="refreshBtn">Refresh package catalog</button>
+        <button class="ghost" onclick="loadDevices()">Refresh devices</button>
+      </div>
+      <div id="syncPanel">
+        <b>Syncing package catalog from upstream&hellip;</b>
+        <div class="mut" id="syncPhase">starting</div>
+        <div class="bar"><div class="fill"></div></div>
+      </div>
+      <div class="grid" id="devGrid"></div>
+      <div class="empty" id="emptyState" style="display:none">
+        No devices enrolled yet. See MANUAL.txt for enrollment steps — copy the server CA
+        (ca.pem) to each agent, then run the agent once with AIRGAP_ENROLL_TOKEN.
+      </div>
+    </div>
+
+    <div class="view" id="viewApprovals">
+      <div class="headline"><h2>Approvals</h2><span class="muted" id="apprCount"></span></div>
+      <div class="empty" id="apprEmpty" style="display:none">No update requests yet. Approve an update from a device&rsquo;s packages drawer.</div>
+      <table style="margin-top:12px">
+        <thead><tr><th>When</th><th>Package</th><th>Device</th><th>From &rarr; To</th><th>Ring</th><th>Approved by</th><th>Status</th></tr></thead>
+        <tbody id="apprBody"></tbody>
+      </table>
+    </div>
+
+    <div class="view" id="viewAudit">
+      <div class="headline"><h2>Audit log</h2></div>
+      <div class="toolbar">
+        <input id="auditActor" placeholder="filter by operator" oninput="renderAudit()">
+        <select id="auditAction" onchange="renderAudit()">
+          <option value="">all actions</option>
+          <option>login</option><option>approve_update</option><option>catalog_refresh</option>
+          <option>operator_create</option><option>operator_delete</option><option>enroll</option><option>register</option>
+        </select>
+      </div>
+      <div class="empty" id="auditEmpty" style="display:none">No audit entries yet.</div>
+      <div class="timeline" id="auditBody"></div>
+    </div>
+
+    <div class="view" id="viewOperators">
+      <div class="headline"><h2>Operators</h2></div>
+      <table style="margin-top:12px">
+        <thead><tr><th>Username</th><th>Role</th><th>Created</th><th></th></tr></thead>
+        <tbody id="opsBody"></tbody>
+      </table>
+      <div class="card" style="margin-top:16px;cursor:default">
+        <h3 style="margin:0 0 10px;font-size:14px">Create operator</h3>
+        <div class="toolbar" style="margin:0">
+          <input id="opName" placeholder="username">
+          <input id="opPass" type="password" placeholder="password">
+          <select id="opRole"><option value="viewer">viewer</option><option value="approver">approver</option><option value="admin">admin</option></select>
+          <button onclick="createOp()">Create</button>
+        </div>
+      </div>
+    </div>
   </div>
-  <div id="syncPanel">
-    <b>Syncing package catalog from upstream&hellip;</b>
-    <div class="mut" id="syncPhase">starting</div>
-    <div class="bar"><div class="fill"></div></div>
-  </div>
-  <div class="grid" id="devGrid"></div>
-  <div class="empty" id="emptyState" style="display:none">
-    No devices enrolled yet. See MANUAL.txt for enrollment steps — copy the server CA
-    (ca.pem) to each agent, then run the agent once with AIRGAP_ENROLL_TOKEN.
-  </div>
-  <div id="pendingPanel" class="card" style="display:none"></div>
 </main>
+</div>
+
 <div id="backdrop" onclick="closeDrawer()"></div>
 <div id="drawer">
   <header>
@@ -391,6 +648,8 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 <script>
 const $ = s => document.querySelector(s);
 const esc = s => String(s??'').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const tokenKey = 'ou_token';
+let role = '';
 
 function toast(msg, type){
   const t = document.createElement('div');
@@ -400,10 +659,16 @@ function toast(msg, type){
   setTimeout(()=>{ t.remove(); }, 5000);
 }
 
-async function api(path, opts){
-  const res = await fetch(path, opts);
-  if(!res.ok){ let m=''; try{ m=(await res.json()).error||m; }catch(_){} throw new Error(m||res.status); }
-  return res.json();
+function api(path, opts){
+  const headers = Object.assign({}, (opts&&opts.headers)||{});
+  const t = localStorage.getItem(tokenKey);
+  if(t) headers['Authorization'] = 'Bearer '+t;
+  if(opts && opts.body) headers['Content-Type'] = 'application/json';
+  return fetch(path, Object.assign({}, opts, {headers})).then(async res=>{
+    if(res.status===401 && path !== '/api/login'){ showLogin(); throw new Error('session expired - sign in again'); }
+    if(!res.ok){ let m=''; try{ m=(await res.json()).error||m; }catch(_){} throw new Error(m||res.status); }
+    return res.json();
+  });
 }
 
 function rel(ts){
@@ -419,8 +684,7 @@ function rel(ts){
 function familyIcon(f){
   const m = { debian:'D', rhel:'R', windows:'W', other:'?' };
   const c = { debian:'#a1005e', rhel:'#f8f8f8', windows:'#38bdf8', other:'#64748b' };
-  const ch = m[f]||'?', bg = c[f]||'#64748b';
-  return '<span class="icon" style="background:'+bg+'">'+ch+'</span>';
+  return '<span class="icon" style="background:'+(c[f]||'#64748b')+'">'+(m[f]||'?')+'</span>';
 }
 
 function statusPill(s){
@@ -429,14 +693,67 @@ function statusPill(s){
   return '<span class="badge bg-idle">'+esc(s||'unknown')+'</span>';
 }
 
+async function doLogin(){
+  const u = $('#user').value.trim(), p = $('#pass').value;
+  $('#loginErr').textContent = '';
+  try{
+    const r = await api('/api/login', {method:'POST', body: JSON.stringify({username:u, password:p})});
+    localStorage.setItem(tokenKey, r.token);
+    role = r.role;
+    enterApp(r.operator, r.role);
+    loadDevices(); loadHealth();
+  }catch(e){ $('#loginErr').textContent = e.message; }
+}
+
+function showLogin(){
+  $('#app').style.display = 'none';
+  $('#login').style.display = 'flex';
+}
+
+function enterApp(op, r){
+  role = r;
+  $('#app').style.display = 'block';
+  $('#login').style.display = 'none';
+  $('#whoami').textContent = op;
+  $('#roleBadge').textContent = r;
+  $('#navOperators').style.display = r === 'admin' ? 'block' : 'none';
+  $('#user').value=''; $('#pass').value='';
+}
+
+async function doLogout(){
+  try{ await api('/api/logout', {method:'POST'}); }catch(_){}
+  localStorage.removeItem(tokenKey);
+  showLogin();
+}
+
+function showView(v){
+  document.querySelectorAll('.view').forEach(el=>el.classList.remove('active'));
+  document.querySelectorAll('nav button').forEach(b=>b.classList.remove('active'));
+  $('#view'+v.charAt(0).toUpperCase()+v.slice(1)).classList.add('active');
+  document.querySelector('nav button[data-view="'+v+'"]').classList.add('active');
+  if(v==='devices'){ loadDevices(); }
+  if(v==='approvals'){ loadApprovals(); }
+  if(v==='audit'){ loadAudit(); }
+  if(v==='operators'){ loadOperators(); }
+}
+
+async function boot(){
+  $('#srvHost').textContent = location.host;
+  const t = localStorage.getItem(tokenKey);
+  if(!t){ showLogin(); return; }
+  try{
+    const me = await api('/api/me');
+    enterApp(me.operator, me.role);
+    loadDevices(); loadHealth(); loadApprovals();
+  }catch(_){ localStorage.removeItem(tokenKey); showLogin(); }
+}
+
 async function loadHealth(){
   try{
     const h = await api('/api/health');
-    $('#healthDot').className = 'dot ' + (h.status==='ok' ? (h.agents?'ok':'ok') : 'bad');
+    $('#healthDot').className = 'dot ok';
     $('#healthTxt').textContent = (h.catalog_syncing?'syncing catalog, ':'') + h.agents + ' device' + (h.agents===1?'':'s');
     $('#lastSync').textContent = rel(h.last_catalog_sync);
-    $('#pendingBadge').textContent = h.pending_approvals;
-    $('#pendingBtn').disabled = h.pending_approvals === 0;
     if(h.catalog_syncing) showSync(h.catalog_phase);
   }catch(e){
     $('#healthDot').className = 'dot bad';
@@ -472,7 +789,6 @@ async function loadDevices(){
             : '<span class="badge bg-idle">up to date</span>'}
         </div>
       </div>`).join('');
-    if(!devs.length) $('#pendingPanel').style.display='none';
   }catch(e){ toast('Failed to load devices: '+e.message, 'err'); }
 }
 
@@ -495,7 +811,7 @@ async function openDrawer(id){
         <td>${esc(p.installed)}</td>
         <td class="${p.update_available?'upd':'ok'}">${p.latest?esc(p.latest):'<span class="muted">unknown</span>'}</td>
         <td>${p.update_available?'<span class="chip upd">update available</span>':'<span class="chip ok">up to date</span>'}</td>
-        <td>${p.update_available?`<button class="ghost" onclick="askUpdate('${esc(data.agent_id)}','${esc(p.name)}')">Approve &amp; update</button>`:''}</td>
+        <td>${(p.update_available && (role==='approver'||role==='admin'))?`<button class="ghost" onclick="askUpdate('${esc(data.agent_id)}','${esc(p.name)}')">Approve &amp; update</button>`:(p.update_available?'<span class="muted">approver role needed</span>':'')}</td>
       </tr>`).join('');
   }catch(e){
     $('#drvBody').innerHTML = '<tr><td colspan="5" class="upd">Failed to load: '+esc(e.message)+'</td></tr>';
@@ -510,10 +826,9 @@ function closeDrawer(){
 async function askUpdate(agentId, pkg){
   if(!confirm('Approve updating '+pkg+' on '+agentId+'?')) return;
   try{
-    const r = await api('/api/update', {method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({agent_id:agentId, package:pkg})});
+    const r = await api('/api/update', {method:'POST', body: JSON.stringify({agent_id:agentId, package:pkg})});
     toast(pkg+': '+r.from_version+' -> '+r.to_version+' approved ('+r.status+')', 'ok');
-    loadHealth(); loadDevices();
+    loadHealth(); loadDevices(); loadApprovals();
     if($('#drawer').classList.contains('open')) openDrawer(agentId);
   }catch(e){ toast('Update request failed: '+e.message, 'err'); }
 }
@@ -521,7 +836,7 @@ async function askUpdate(agentId, pkg){
 let syncing = false;
 function showSync(phase){
   $('#syncPanel').style.display='block';
-  $('#syncPhase').textContent = phase + ' &hellip; please wait, this can take a minute';
+  $('#syncPhase').innerHTML = phase + ' &hellip; please wait, this can take a minute';
   $('#refreshBtn').disabled = true;
 }
 function hideSync(){
@@ -551,25 +866,83 @@ async function refreshCatalog(){
   loadHealth();
 }
 
-async function togglePending(){
-  const p = $('#pendingPanel');
-  if(p.style.display === 'block'){ p.style.display='none'; return; }
+async function loadApprovals(){
   try{
     const upds = await api('/api/updates');
-    if(!upds.length){ toast('No pending approvals', ''); return; }
-    p.innerHTML = '<h3 style="margin:0 0 8px;font-size:14px">Pending update approvals ('+upds.length+')</h3>'
-      + upds.slice().reverse().slice(0,100).map(u=>`
-        <div class="row"><span><b>${esc(u.package)}</b></span>
-          <span class="muted">${esc(u.agent_id)} ${esc(u.from_version)} &rarr; ${esc(u.to_version)} <b class="upd">${esc(u.status)}</b></span></div>`).join('');
-    p.style.display = 'block';
+    $('#apprCount').textContent = '('+upds.length+')';
+    $('#apprEmpty').style.display = upds.length ? 'none' : 'block';
+    $('#apprBody').innerHTML = upds.slice().reverse().map(u=>`
+      <tr>
+        <td class="mut">${rel(u.ts)}</td>
+        <td><b>${esc(u.package)}</b></td>
+        <td>${esc(u.agent_id)}</td>
+        <td>${esc(u.from_version)} &rarr; ${esc(u.to_version)}</td>
+        <td><span class="badge bg-idle">${esc(u.ring)}</span></td>
+        <td>${esc(u.approved_by||'&ndash;')}</td>
+        <td><span class="chip upd">${esc(u.status)}</span></td>
+      </tr>`).join('');
   }catch(e){ toast('Failed to load approvals: '+e.message, 'err'); }
+}
+
+let auditCache = [];
+async function loadAudit(){
+  try{
+    auditCache = await api('/api/audit');
+    renderAudit();
+  }catch(e){ toast('Failed to load audit log: '+e.message, 'err'); }
+}
+function renderAudit(){
+  const actor = ($('#auditActor').value||'').toLowerCase();
+  const action = $('#auditAction').value;
+  const rows = auditCache.filter(e=> (!actor || (e.actor||'').toLowerCase().includes(actor)) && (!action || e.action===action));
+  $('#auditEmpty').style.display = rows.length ? 'none' : 'block';
+  $('#auditBody').innerHTML = rows.map(e=>`
+    <div class="evt">
+      <span class="t">${rel(e.ts)}</span>
+      <span class="a">${esc(e.actor||'&ndash;')}</span>
+      <span class="act">${esc(e.action)}</span>
+      <span class="tg">${esc(e.target||'')}</span>
+      <span class="r ${e.result==='ok'?'ok':'upd'}">${esc(e.result)}</span>
+    </div>`).join('');
+}
+
+async function loadOperators(){
+  try{
+    const ops = await api('/api/operators');
+    $('#opsBody').innerHTML = ops.map(o=>`
+      <tr>
+        <td>${esc(o.name)}</td>
+        <td><span class="badge ${o.role==='admin'?'bg-upd':'bg-idle'}">${esc(o.role)}</span></td>
+        <td class="mut">${rel(o.created_at)}</td>
+        <td>${o.name===$('#whoami').textContent?'':`<button class="ghost" onclick="delOp('${esc(o.name)}')">Delete</button>`}</td>
+      </tr>`).join('');
+  }catch(e){ toast('Failed to load operators: '+e.message, 'err'); }
+}
+
+async function createOp(){
+  const name = $('#opName').value.trim(), pw = $('#opPass').value, r = $('#opRole').value;
+  try{
+    await api('/api/operators', {method:'POST', body: JSON.stringify({name, password:pw, role:r})});
+    toast('Operator '+name+' created', 'ok');
+    $('#opName').value=''; $('#opPass').value='';
+    loadOperators();
+  }catch(e){ toast('Create failed: '+e.message, 'err'); }
+}
+
+async function delOp(name){
+  if(!confirm('Delete operator '+name+'?')) return;
+  try{
+    await api('/api/operators/'+encodeURIComponent(name), {method:'DELETE'});
+    toast('Operator '+name+' deleted', 'ok');
+    loadOperators();
+  }catch(e){ toast('Delete failed: '+e.message, 'err'); }
 }
 
 setInterval(()=>{ document.querySelectorAll('[data-ls]').forEach(el=>{ el.textContent = rel(el.dataset.ls); }); }, 15000);
 setInterval(loadHealth, 30000);
+$('#pass').addEventListener('keydown', e=>{ if(e.key==='Enter') doLogin(); });
 
-$('#srvHost').textContent = location.host;
-loadHealth(); loadDevices();
+boot();
 </script>
 </body>
 </html>

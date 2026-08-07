@@ -28,3 +28,5 @@ quick-xml = "0.36"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 tower = "0.5"
+argon2.workspace = true
+rand.workspace = true

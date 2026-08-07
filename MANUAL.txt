@@ -53,6 +53,8 @@ RUN THE SERVER (on the machine that will be the update server)
     AIRGAP_LISTEN       mTLS API address        DEFAULT: 0.0.0.0:8443
     AIRGAP_HTTP_LISTEN  dashboard/HTTP address  DEFAULT: 0.0.0.0:8080
     AIRGAP_ENROLL_TOKEN enrollment token seed    DEFAULT: airgap-bootstrap
+    AIRGAP_ADMIN_PASSWORD initial dashboard admin password (first boot only)
+                                             DEFAULT: admin (change this!)
 
   On first boot the server generates its own CA (ca.pem + ca-key.pem),
   a server certificate, and the default enrollment token. Keep the state
@@ -68,7 +70,10 @@ RUN THE SERVER (on the machine that will be the update server)
     GET  /health     -> JSON: status, agents, pending_approvals, last sync
 
   DASHBOARD (plain HTTP on :8080 - point a browser at the server's IP):
-    GET  /                        web dashboard (v2)
+    GET  /                        web dashboard (v2, login required)
+    POST /api/login               {"username":..,"password":..} -> session token
+    POST /api/logout              ends the session
+    GET  /api/me                  current operator + role
     GET  /api/devices             all devices + per-device update counts
     GET  /api/devices/<id>/packages   per-device installed vs latest
     POST /api/refresh             sync upstream apt/dnf metadata (catalog)
@@ -77,11 +82,26 @@ RUN THE SERVER (on the machine that will be the update server)
     GET  /api/updates             pending update approvals
     GET  /api/audit               recent audit-log entries (operator actions)
     GET  /api/health              JSON health (devices, pending, last sync)
+    GET  /api/operators           list operators (admin only)
+    POST /api/operators           create operator (admin only)
+    DELETE /api/operators/<name>  delete operator (admin only)
+
+  Every /api/* call except /api/login requires the session token from login,
+  sent as an "Authorization: Bearer <token>" header (the dashboard does this
+  automatically). Roles: viewer (read-only), approver (can also approve
+  updates and refresh the catalog), admin (also manages operators).
+  Approvals and refresh require at least the approver role; operator
+  management requires admin. Failed and successful logins are written to the
+  audit log.
+
+  First boot creates the operator "admin" with password from the
+  AIRGAP_ADMIN_PASSWORD environment variable (default: "admin" - change it!).
+  The operator list is stored (argon2-hashed) in <AIRGAP_STORE_DIR>/operators.json.
 
   On the server, an append-only audit log is kept in the state directory as
-  <AIRGAP_STORE_DIR>/audit.log (one JSON line per operator action: approvals,
-  catalog refreshes, agent enrollments/registrations). It is NOT the same as
-  reports.json (which is agent-reported install status).
+  <AIRGAP_STORE_DIR>/audit.log (one JSON line per operator action: logins,
+  approvals, catalog refreshes, operator management, agent enrollments).
+  It is NOT the same as reports.json (agent-reported install status).
 
   State files are written via temp-file + atomic rename so a crash mid-write
   cannot corrupt them.
@@ -126,14 +146,17 @@ VERIFY / MANUAL TEST
   3. Check registered agents on the server:
        /var/lib/airgap-server/agents.json
   4. Open the dashboard:   http://<server-ip>:8080
+       - sign in (first boot: admin / <AIRGAP_ADMIN_PASSWORD>, default "admin")
        - devices are shown as cards with IP, OS, arch, kernel, status and
          the number of available updates
        - click a card to open a drawer with installed vs latest versions
        - "Refresh package catalog" shows live progress and fetches latest
        - "Approve & update" asks for confirmation and records the approval
-         (pending approvals are listed in the dashboard header)
+         (fleet-wide approvals live in the Approvals view)
   5. Audit log (who did what):
        tail /var/lib/airgap-server/audit.log
+  6. Roles: sign in with a viewer account to verify read-only (no Approve
+     buttons, POST /api/update returns 403).
 
 NETWORKING NOTES
 ----------------

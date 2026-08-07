@@ -1,5 +1,6 @@
 pub mod api;
 pub mod audit;
+pub mod auth;
 pub mod ca;
 pub mod catalog;
 pub mod http;
@@ -11,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::extract::DefaultBodyLimit;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::Router;
 use tokio::sync::Mutex;
 use tokio_rustls::TlsAcceptor;
@@ -43,6 +44,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(store::Store::load(&store_dir).await?);
     let catalog = Arc::new(catalog::Catalog::load(&store_dir).await?);
     let audit = Arc::new(audit::AuditLog::new(&store_dir));
+    let auth = Arc::new(auth::Auth::load(&store_dir).await?);
 
     let api_state = ApiState {
         store: store.clone(),
@@ -70,6 +72,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         store: store.clone(),
         catalog: catalog.clone(),
         audit: audit.clone(),
+        auth: auth.clone(),
     };
     let http_app = Router::new()
         .route("/", get(http::dashboard))
@@ -81,6 +84,12 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/updates", get(http::pending_updates))
         .route("/api/audit", get(http::audit_log))
         .route("/api/health", get(http::health))
+        .route("/api/login", post(http::login))
+        .route("/api/logout", post(http::logout))
+        .route("/api/me", get(http::me))
+        .route("/api/operators", get(http::list_operators))
+        .route("/api/operators", post(http::create_operator))
+        .route("/api/operators/:name", delete(http::delete_operator))
         .with_state(http_state);
     let http_task = http::serve(http_listen, http_app);
 
