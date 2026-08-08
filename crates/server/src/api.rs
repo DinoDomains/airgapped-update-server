@@ -247,7 +247,7 @@ pub async fn report(
     Json(ReportResponse { accepted: true }).into_response()
 }
 
-const MAX_ARTIFACT_BYTES: usize = 256 * 1024 * 1024;
+const MAX_ARTIFACT_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Serves the actual .rpm/.deb for an approved-pending update by proxying it
 /// from the whitelisted upstream source. The server is the only online host;
@@ -273,7 +273,7 @@ pub async fn artifact(
         return err(StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded");
     }
     let family = req.family.to_lowercase();
-    if family != "rhel" && family != "debian" {
+    if family != "rhel" && family != "debian" && family != "windows" {
         return err(StatusCode::BAD_REQUEST, "unsupported family");
     }
     let Some(update) = st.store.update_request(&req.update_id).await else {
@@ -314,6 +314,25 @@ pub async fn artifact(
             ),
         );
     };
+
+    if let Some(local) = url.strip_prefix("file://") {
+        let bytes = match tokio::fs::read(local).await {
+            Ok(b) => b,
+            Err(e) => {
+                return err(
+                    StatusCode::NOT_FOUND,
+                    format!("staged artifact unavailable on server: {e}"),
+                )
+            }
+        };
+        if bytes.is_empty() || bytes.len() > MAX_ARTIFACT_BYTES {
+            return err(StatusCode::BAD_GATEWAY, "artifact is empty or too large");
+        }
+        let _ = tokio::fs::create_dir_all(&artifact_dir).await;
+        let _ = tokio::fs::write(&cached, &bytes).await;
+        st.audit.log(&cn, "artifact", &update.package, local);
+        return artifact_response(&artifact_filename(&update.package, &family), &bytes);
+    }
 
     let client = catalog::build_client(&sources);
     let resp = match client.get(&url).send().await {
@@ -362,7 +381,13 @@ fn artifact_filename(pkg: &str, family: &str) -> String {
     } else {
         "package"
     };
-    let ext = if family == "debian" { "deb" } else { "rpm" };
+    let ext = if family == "debian" {
+        "deb"
+    } else if family == "windows" {
+        "msu"
+    } else {
+        "rpm"
+    };
     format!("{base}.{ext}")
 }
 

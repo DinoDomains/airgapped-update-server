@@ -61,6 +61,7 @@ pub struct SyncReport {
     pub packages: usize,
     pub apt: usize,
     pub dnf: usize,
+    pub windows: usize,
 }
 
 const APT_COMPONENTS: &[&str] = &["main", "universe"];
@@ -73,8 +74,13 @@ const APT_ARCH: &str = "amd64";
 pub fn build_client(sources: &[Source]) -> reqwest::Client {
     use std::net::ToSocketAddrs;
     let mut builder = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(90));
-    for host in upstream_hosts(sources) {
+        .timeout(std::time::Duration::from_secs(120));
+    for host in upstream_hosts(sources).into_iter().chain(
+        // Windows artifact hosts are not listed in the source config (the
+        // catalog source's base_url is the search site) but are used when
+        // proxying .msu files - pin them too so they never stall on IPv6.
+        EXTRA_PINNED_HOSTS.iter().map(|h| h.to_string()),
+    ) {
         if let Ok(addr) = format!("{host}:80").to_socket_addrs() {
             if let Some(a) = addr.filter(|a| a.is_ipv4()).next() {
                 builder = builder.resolve(&host, a);
@@ -83,6 +89,14 @@ pub fn build_client(sources: &[Source]) -> reqwest::Client {
     }
     builder.build().expect("failed to build http client")
 }
+
+/// Hosts used to fetch Windows .msu artifacts, pinned to IPv4 alongside the
+/// configured sources (they are not themselves configured sources).
+const EXTRA_PINNED_HOSTS: &[&str] = &[
+    "download.windowsupdate.com",
+    "catalog.s.download.windowsupdate.com",
+    "download.microsoft.com",
+];
 
 fn upstream_hosts(sources: &[Source]) -> Vec<String> {
     let mut hosts = Vec::new();
@@ -152,6 +166,13 @@ impl Catalog {
         if pkg.location.is_empty() {
             return None;
         }
+        // Windows (wucatalog) entries store an absolute MSU URL; apt/dnf
+        // entries store a relative path joined onto the source base URL.
+        if family.eq_ignore_ascii_case("windows") || pkg.location.starts_with("http://")
+            || pkg.location.starts_with("https://")
+        {
+            return Some(pkg.location.clone());
+        }
         let src = if family.eq_ignore_ascii_case("debian") {
             let suite = pkg.repo.split('/').next().unwrap_or("");
             sources
@@ -209,10 +230,12 @@ impl Catalog {
         let mut merged: HashMap<String, LatestPackage> = HashMap::new();
         let mut apt_count = 0usize;
         let mut dnf_count = 0usize;
+        let mut windows_count = 0usize;
 
         let apt_sources: Vec<&Source> = sources.iter().filter(|s| s.kind == "apt").collect();
         let dnf_sources: Vec<&Source> = sources.iter().filter(|s| s.kind == "dnf").collect();
-        if apt_sources.is_empty() && dnf_sources.is_empty() {
+        let wu_sources: Vec<&Source> = sources.iter().filter(|s| s.kind == "wucatalog").collect();
+        if apt_sources.is_empty() && dnf_sources.is_empty() && wu_sources.is_empty() {
             return Err("no enabled upstream sources; whitelist at least one in the Sources view".to_string());
         }
 
@@ -278,6 +301,58 @@ impl Catalog {
             }
         }
 
+        self.set_phase("fetching windows update catalog").await;
+        for src in &wu_sources {
+            let base = src.base_url.trim_end_matches('/').to_string();
+            for kb in &src.kbs {
+                let kb = kb.trim().to_uppercase();
+                if kb.is_empty() || !kb.starts_with("KB") {
+                    continue;
+                }
+                match wu_sync_kb(client, &base, &kb).await {
+                    Ok(Some((version, arch, location))) => {
+                        insert_latest(
+                            &mut merged,
+                            kb.clone(),
+                            version,
+                            DistroFamily::Windows,
+                            src.name.clone(),
+                            arch,
+                            location,
+                        );
+                        windows_count += 1;
+                    }
+                    Ok(None) => tracing::warn!("no downloadable artifact found for {kb}"),
+                    Err(e) => tracing::warn!("windows catalog sync {kb}: {e}"),
+                }
+            }
+            // Local MSU dropbox: any <store>/windows/*.msu is indexed too.
+            // Operators can stage genuine packages here (downloaded from the
+            // catalog on an unrestricted machine) - the platform still does
+            // the approving, proxying and installing, with no separate WSUS.
+            let dropbox = self.dir.join("windows");
+            if let Ok(rd) = std::fs::read_dir(&dropbox) {
+                let mut files: Vec<_> = rd.flatten().map(|e| e.path()).collect();
+                files.sort();
+                for path in files {
+                    if path.extension().map(|x| x == "msu").unwrap_or(false) {
+                        if let Some((kb, version, arch)) = msu_metadata(&path) {
+                            insert_latest(
+                                &mut merged,
+                                kb,
+                                version,
+                                DistroFamily::Windows,
+                                src.name.clone(),
+                                arch,
+                                format!("file://{}", path.display()),
+                            );
+                            windows_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+
         self.set_phase("merging").await;
         let data = CatalogData {
             packages: merged,
@@ -297,6 +372,7 @@ impl Catalog {
             packages: self.data.read().await.packages.len(),
             apt: apt_count,
             dnf: dnf_count,
+            windows: windows_count,
         };
         tracing::info!("catalog sync complete: {report:?}");
         Ok(report)
@@ -472,6 +548,249 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// A single row of a Microsoft Update Catalog search result.
+struct WuRow {
+    kb: String,
+    title: String,
+    date: String,
+    guid: String,
+    uid_info: String,
+    arch: String,
+}
+
+/// Syncs one KB from the Microsoft Update Catalog: searches, picks the best
+/// matching row (x64 / server builds preferred), resolves the direct .msu
+/// download URL, and returns (version, arch, absolute download URL).
+async fn wu_sync_kb(
+    client: &reqwest::Client,
+    base: &str,
+    kb: &str,
+) -> Result<Option<(String, String, String)>, String> {
+    let rows = wu_search(client, base, kb).await?;
+    let mut rows: Vec<WuRow> = rows
+        .into_iter()
+        .filter(|r| r.kb.eq_ignore_ascii_case(kb))
+        .collect();
+    rows.sort_by(|a, b| wu_score(b).cmp(&wu_score(a)));
+    for row in rows {
+        if let Some(url) = wu_download_url(client, base, &row.guid, &row.uid_info).await {
+            tracing::info!(
+                "windows catalog: {kb} ({}) -> {}",
+                row.title,
+                url.split('/').next_back().unwrap_or(&url)
+            );
+            return Ok(Some((row.date, row.arch, url)));
+        }
+    }
+    Ok(None)
+}
+
+/// Ranks catalog rows so the one actually meant for this box wins when a
+/// KB search returns several products/architectures.
+fn wu_score(r: &WuRow) -> u32 {
+    let t = r.title.to_lowercase();
+    let mut s = 0u32;
+    if r.arch == "x64" {
+        s += 50;
+    }
+    if t.contains("server") {
+        s += 30;
+    }
+    if t.contains("2022") {
+        s += 10;
+    }
+    if t.contains("security") {
+        s += 5;
+    }
+    s
+}
+
+/// GETs the catalog search page for `kb` and parses every result row.
+async fn wu_search(client: &reqwest::Client, base: &str, kb: &str) -> Result<Vec<WuRow>, String> {
+    let url = format!("{base}/Search.aspx?q={kb}");
+    let body = fetch(client, &url).await?;
+    Ok(parse_wu_rows(&String::from_utf8_lossy(&body)))
+}
+
+/// Parses the HTML table of the catalog search results page. Each row has a
+/// "Download" button whose onclick calls `goToDownload('1','<guid>','<uid>')`.
+fn parse_wu_rows(html: &str) -> Vec<WuRow> {
+    let re_download =
+        regex::Regex::new(r#"goToDownload\('1','([^']+)','([^']*)'\)"#).unwrap();
+    let re_kb = regex::Regex::new(r"(?i)\bKB\d+\b").unwrap();
+    let re_title =
+        regex::Regex::new(r#"class="titleColumn"><a[^>]*>(?s)([^<]+)</a>"#).unwrap();
+    let re_date = regex::Regex::new(r"\b\d{1,2}/\d{1,2}/\d{4}\b").unwrap();
+
+    let mut rows = Vec::new();
+    for chunk in html.split("<tr") {
+        let Some(cap) = re_download.captures(chunk) else {
+            continue;
+        };
+        let guid = cap[1].to_string();
+        let uid_info = cap[2].to_string();
+        let kb = re_kb
+            .find(chunk)
+            .map(|m| m.as_str().to_uppercase())
+            .unwrap_or_default();
+        let title = re_title
+            .captures(chunk)
+            .map(|c| c[1].trim().to_string())
+            .unwrap_or_default();
+        let date = re_date
+            .find_iter(chunk)
+            .last()
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
+        let arch = if title.to_lowercase().contains("arm64") {
+            "arm64".to_string()
+        } else if title.to_lowercase().contains("x86") || title.to_lowercase().contains("32-bit") {
+            "x86".to_string()
+        } else if title.to_lowercase().contains("x64")
+            || title.to_lowercase().contains("64-bit")
+            || title.to_lowercase().contains("amd64")
+        {
+            "x64".to_string()
+        } else {
+            String::new()
+        };
+        rows.push(WuRow {
+            kb,
+            title,
+            date: normalize_wu_date(&date),
+            guid,
+            uid_info,
+            arch,
+        });
+    }
+    rows
+}
+
+/// Normalizes "6/11/2024" to "2024-06-11".
+fn normalize_wu_date(date: &str) -> String {
+    let parts: Vec<&str> = date.split('/').collect();
+    if parts.len() != 3 {
+        return date.to_string();
+    }
+    let (m, d, y) = (parts[0], parts[1], parts[2]);
+    let (m, d) = match (m.parse::<u32>(), d.parse::<u32>()) {
+        (Ok(m), Ok(d)) if (1..=12).contains(&m) && (1..=31).contains(&d) => (m, d),
+        _ => return date.to_string(),
+    };
+    format!("{y}-{m:02}-{d:02}")
+}
+
+/// Derives (kb, version, arch) from an MSU filename like
+/// `windows10.0-kb5039227-x64_<hex>.msu` or `WindowsServer2022-KB5039227.msu`.
+/// Version falls back to the file's mtime.
+fn msu_metadata(path: &std::path::Path) -> Option<(String, String, String)> {
+    let name = path.file_name()?.to_string_lossy().to_lowercase();
+    let kb = regex::Regex::new(r"\bkb\d+\b").ok()?.find(&name)?.as_str().to_uppercase();
+    let arch = if name.contains("arm64") { "arm64".to_string() } else { "x64".to_string() };
+    let version = if let Some(cap) = regex::Regex::new(r"(\d{4}-\d{2}-\d{2})").ok()?.captures(&name) {
+        cap.get(1)?.as_str().to_string()
+    } else if let Ok(md) = std::fs::metadata(path) {
+        if let Ok(modified) = md.modified() {
+            let d = std::time::SystemTime::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(
+                modified.duration_since(std::time::SystemTime::UNIX_EPOCH).ok()?.as_secs(),
+            ))?;
+            let dt: chrono::DateTime<chrono::Utc> = d.into();
+            dt.format("%Y-%m-%d").to_string()
+        } else {
+            "2024-01-01".to_string()
+        }
+    } else {
+        "2024-01-01".to_string()
+    };
+    Some((kb, version, arch))
+}
+
+/// POSTs the catalog's download dialog with an update id and extracts the
+/// direct .msu/.cab URL (on download.windowsupdate.com or similar CDN).
+async fn wu_download_url(
+    client: &reqwest::Client,
+    base: &str,
+    guid: &str,
+    uid_info: &str,
+) -> Option<String> {
+    let body = format!(
+        r#"updateIDs=[{{"size":0,"languages":"","uidInfo":"{uid_info}","updateID":"{guid}"}}]"#
+    );
+    let url = format!("{base}/DownloadDialog.aspx");
+    let resp = client
+        .post(&url)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(body)
+        .send()
+        .await
+        .ok()?;
+    let text = resp.text().await.ok()?;
+    let re = regex::Regex::new(r#"https://[^"'\s]+\.(?:msu|cab)"#).ok()?;
+    re.find(&text).map(|m| m.as_str().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_catalog_search_rows() {
+        let html = r##"
+<html><body>
+<table class="results">
+<tr>
+  <td><input type="checkbox" id="checkbox_a1c1095d-4024-4505-b500-10e48460b99c" /></td>
+  <td class="idColumn"><a href="/Search.aspx?q=KB5039227">KB5039227</a></td>
+  <td class="titleColumn"><a href="/Search.aspx?q=KB5039227">2024-06 Cumulative Update for Microsoft server operating system version 21H2 for x64-based Systems (KB5039227)</a></td>
+  <td class="resultsRightColumn">Chinese (Simplified), English</td>
+  <td class="resultsRightColumn">~ 207.6 MB</td>
+  <td class="resultsRightColumn">6/11/2024</td>
+  <td class="resultsRightColumn"><a class="tableButton" href="#" onclick="goToDownload('1','a1c1095d-4024-4505-b500-10e48460b99c','a1c1095d-4024-4505-b500-10e48460b99c');return false;">Download</a></td>
+</tr>
+<tr>
+  <td><input type="checkbox" id="checkbox_11111111-2222-3333-4444-555555555555" /></td>
+  <td class="idColumn"><a href="/Search.aspx?q=KB5039227">KB5039227</a></td>
+  <td class="titleColumn"><a href="/Search.aspx?q=KB5039227">2024-06 Cumulative Update for Microsoft server operating system version 21H2 for ARM64-based Systems (KB5039227)</a></td>
+  <td class="resultsRightColumn">English</td>
+  <td class="resultsRightColumn">~ 150.1 MB</td>
+  <td class="resultsRightColumn">6/11/2024</td>
+  <td class="resultsRightColumn"><a class="tableButton" href="#" onclick="goToDownload('1','11111111-2222-3333-4444-555555555555','11111111-2222-3333-4444-555555555555');return false;">Download</a></td>
+</tr>
+<tr>
+  <td class="resultsRightColumn" colspan="7">no goToDownload in this row</td>
+</tr>
+</table>
+</body></html>
+"##;
+        let rows = parse_wu_rows(html);
+        assert_eq!(rows.len(), 2, "two result rows with download buttons");
+        let x64 = rows.iter().find(|r| r.arch == "x64").unwrap();
+        assert_eq!(x64.kb, "KB5039227");
+        assert_eq!(x64.date, "2024-06-11");
+        assert_eq!(x64.guid, "a1c1095d-4024-4505-b500-10e48460b99c");
+        assert!(x64.title.contains("x64-based"));
+        let arm = rows.iter().find(|r| r.arch == "arm64").unwrap();
+        assert_eq!(arm.guid, "11111111-2222-3333-4444-555555555555");
+        assert!(wu_score(x64) > wu_score(arm), "x64/server rows rank first");
+    }
+
+    #[test]
+    fn normalizes_dates() {
+        assert_eq!(normalize_wu_date("6/11/2024"), "2024-06-11");
+        assert_eq!(normalize_wu_date("12/1/2023"), "2023-12-01");
+        assert_eq!(normalize_wu_date(""), "");
+    }
+
+    #[test]
+    fn extracts_download_url() {
+        let html = r#"<html><body><a href="https://catalog.s.download.windowsupdate.com/d/msdownload/update/software/updt/2024/06/windows10.0-kb5039227-x64_b1d1f0a.msu"><input type="button" id="downloadButton" class="tableButton" value="Download" /></a></body></html>"#;
+        let re = regex::Regex::new(r#"https://[^"'\s]+\.(?:msu|cab)"#).unwrap();
+        let m = re.find(html).unwrap();
+        assert!(m.as_str().ends_with(".msu"));
+        assert!(m.as_str().contains("kb5039227"));
+    }
 }
 
 fn insert_latest(

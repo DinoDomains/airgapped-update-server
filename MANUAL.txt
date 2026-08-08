@@ -1,9 +1,9 @@
 AIRGAP UPDATE PLATFORM - BETA 0.1.0 - RUN MANUAL
 ================================================
 Mutual-TLS update server + isolated agents (M0 milestone).
-Last updated with the provisioning + artifact-install tranche (Linux:
-discovery, SSH credential push, and offline dnf/dpkg installs proxied
-through the server).
+Last updated with the Windows Update Catalog tranche: KB-based Windows
+updates without a separate WSUS (catalog sync + local MSU dropbox +
+wusa/DISM install proxied through the server).
 
 WHAT THIS IS
 ------------
@@ -162,11 +162,34 @@ RUN THE SERVER (on the machine that will be the update server)
   Upstream sources (the "whitelist of places updates may be downloaded
   from"): stored in <AIRGAP_STORE_DIR>/sources.json and managed from the
   dashboard Sources view (admin). Each source has a name, family (debian,
-  rhel, windows, other), kind (apt, dnf, none), base URL and - for apt - a
-  suite. Only ENABLED sources are used by the catalog sync; "none" stores a
-  source without syncing (e.g. a future Windows/WSUS mirror). On first boot
-  the server seeds the Ubuntu noble + Rocky 8 mirrors. The catalog sync
-  refuses to run if no enabled apt/dnf source exists.
+  rhel, windows, other), kind (apt, dnf, wucatalog, none), base URL, an
+  optional suite, and - for wucatalog - a kbs list (the KB allowlist).
+  Only ENABLED sources are used by the catalog sync; "none" stores a
+  source without syncing (e.g. a future mirror). On first boot the server
+  seeds the Ubuntu noble + Rocky 8 mirrors plus a disabled
+  "windows-update-catalog" source.
+
+  Windows updates without WSUS (wucatalog sources):
+    - Create/enable a source with kind "wucatalog", family "windows",
+      base_url "https://www.catalog.update.microsoft.com" and a kbs list
+      (e.g. ["KB5039227"]). On each catalog refresh the server queries the
+      Microsoft Update Catalog for every KB, picks the best x64 package
+      (server build preferred, security updates ranked first, arm64 last),
+      resolves the download dialog, and records the resulting direct
+      .msu URL in the catalog.
+    - The datacenter/air-gap network may not reach Microsoft's CDNs. The
+      platform therefore also indexes any genuine .msu staged by an
+      operator in <AIRGAP_STORE_DIR>/windows/ (the "dropbox"). Filenames
+      like "windows10.0-kb5039227-x64_<hex>.msu" or "KB5039227-x64.msu"
+      yield the KB/arch; the file mtime supplies the version. Staged
+      packages are served from disk over the mTLS artifact channel (no
+      WSUS, no separate online machine needed).
+    - A Windows device is "up to date" per KB membership: a catalog KB
+      that is not in the device's installed HotFix set shows as an
+      available update; once installed it disappears. Approving a KB that
+      is already installed is refused (400).
+    - KB allowlists and the dropbox are the only two inputs: the catalog
+      is never used as a source of truth for installed state.
 
   Scanning devices: a dashboard "Scan for updates" button (or "Scan all
   devices") marks a device for a fresh scan. The agent picks this up on its
@@ -259,7 +282,11 @@ WINDOWS AGENT (Server Core VM)
   Windows inventory: OS caption/version via Get-WmiObject Win32_OperatingSystem
   (Get-CimInstance fails on some Server Core builds), packages = KB hotfixes
   from Get-HotFix, family=Windows, arch AMD64. Approved updates install via
-  wusa.exe <artifact> /quiet /norestart (MSU artifacts).
+  wusa.exe <artifact> /quiet /norestart (MSU artifacts). Cumulative updates
+  that embed a servicing stack (SSU) must be applied with the SSU first -
+  wusa handles a well-formed MSU (which carries both) in one call; if the
+  agent's wusa attempt reports failure, install the SSU cab then the LCU cab
+  from the MSU with DISM (see HOW APPROVED UPDATES GET INSTALLED).
   Lab notes (VMware, host-only 172.16.5.0/24):
     - Give every VM a UNIQUE static MAC - a duplicate MAC silently breaks
       vmnet1 connectivity (ARP incomplete, sshd/WinRM unreachable).
@@ -274,10 +301,12 @@ HOW APPROVED UPDATES GET INSTALLED
 ----------------------------------
   1. The catalog records the upstream artifact path for every package it
      syncs (apt `Filename:` from Packages.gz, dnf `location href` from
-     primary.xml). Old catalogs lack these; refresh the catalog once after
-     upgrading to pick them up.
-  2. Approving a package from a device drawer creates an "approved-pending"
-     update request (dev ring, recorded in updates.json + audit log).
+     primary.xml, Windows the .msu URL from the Update Catalog dialog or a
+     staged dropbox file). Old catalogs lack these; refresh the catalog once
+     after upgrading to pick them up.
+  2. Approving a package (or Windows KB) from a device drawer creates an
+     "approved-pending" update request (dev ring, recorded in updates.json +
+     audit log).
   3. On its next poll the agent sees the request and calls POST /artifact
      over mTLS. The server verifies the update is approved-pending AND
      belongs to that agent, resolves the artifact URL against the whitelisted
@@ -298,6 +327,14 @@ HOW APPROVED UPDATES GET INSTALLED
                   satisfied - otherwise the install fails and the report shows
                   the dpkg error)
         - Windows: wusa.exe <file.msu> /quiet /norestart  (one MSU at a time)
+                  Cumulative updates may need the SSU inside the MSU applied
+                  first; if the wusa attempt fails on a very old build, run:
+                    expand -F:* <file.msu> C:\extract
+                    dism /Online /Add-Package /PackagePath:C:\extract\SSU-*.cab /NoRestart
+                    dism /Online /Add-Package /PackagePath:C:\extract\Windows10.0-KB*-x64.cab /NoRestart
+                  then reboot. The KB is confirmed installed when
+                  `wmic qfe list brief` shows it and the OS build (UBR) has
+                  advanced (e.g. 20348.587 -> 20348.2527 for KB5039227).
    5. The agent reports the outcome per update (code ok/failed + detail,
       usually the newly installed version), the requests become done/failed,
       and the agent re-collects its inventory so the dashboard shows the new
@@ -365,5 +402,11 @@ KNOWN LIMITATIONS (BETA)
     suites/sources; a same-version package from a different suite may win the
     merge and its artifact URL is what gets served.
   - Enrollment token is a single shared secret.
+  - Windows update availability is KB-membership based: the platform shows
+    a KB as available until it appears in the device's Get-HotFix set. It
+    does not model supersession chains (a newer cumulative update supersedes
+    the older KB but both would still be offered until installed), and
+    cumulative updates that embed an SSU are best applied via DISM when the
+    base OS build is very old (wusa may fail the SSU-first ordering).
   - Auth sessions are in-memory (expire on server restart).
   - SELinux left Permissive in the lab; needs a hardening pass for prod.

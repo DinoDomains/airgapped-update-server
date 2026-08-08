@@ -82,10 +82,35 @@ fn pkg_update_available(
     catalog: &HashMap<String, LatestPackage>,
 ) -> bool {
     let family = format!("{:?}", inv.family).to_lowercase();
+    // Windows updates are tracked by KB membership, not version: a KB is
+    // "available" when it exists in the catalog but is not installed, which
+    // is computed separately (see windows_updates_available). Installed KBs
+    // are always up to date here.
+    if family == "windows" {
+        return false;
+    }
     match (catalog.get(&crate::catalog::key_of(&family, name)), version.is_empty()) {
         (Some(l), false) => l.version != version,
         _ => false,
     }
+}
+
+/// For Windows agents the catalog holds KB updates; one is available when it
+/// is in the catalog but not in the installed package set.
+fn windows_updates_available(
+    inv: &OsInventory,
+    catalog: &HashMap<String, LatestPackage>,
+) -> usize {
+    let installed: std::collections::HashSet<String> = inv
+        .packages
+        .iter()
+        .map(|p| p.name.to_lowercase())
+        .collect();
+    catalog
+        .values()
+        .filter(|l| l.family.eq_ignore_ascii_case("windows"))
+        .filter(|l| !installed.contains(&l.name.to_lowercase()))
+        .count()
 }
 
 #[derive(Serialize)]
@@ -109,15 +134,17 @@ struct DeviceSummary {
 
 fn summarize(r: AgentRecord, catalog: &HashMap<String, LatestPackage>) -> DeviceSummary {
     let inv = r.inventory.clone();
-    let updates_available = inv
-        .as_ref()
-        .map(|i| {
+    let updates_available = inv.as_ref().map(|i| {
+        let family = format!("{:?}", i.family).to_lowercase();
+        if family == "windows" {
+            windows_updates_available(i, catalog)
+        } else {
             i.packages
                 .iter()
                 .filter(|p| pkg_update_available(i, &p.name, &p.version, catalog))
                 .count()
-        })
-        .unwrap_or(0);
+        }
+    }).unwrap_or(0);
     DeviceSummary {
         id: r.agent_id,
         hostname: r.hostname,
@@ -213,6 +240,37 @@ pub async fn device_packages(
             }
         })
         .collect();
+    // Windows: surface catalog KBs that are not yet installed so an
+    // operator can approve them (a KB is "available" by membership).
+    let family = format!("{:?}", inv.family).to_lowercase();
+    if family == "windows" {
+        let installed: std::collections::HashSet<String> = inv
+            .packages
+            .iter()
+            .map(|p| p.name.to_lowercase())
+            .collect();
+        let mut avail: Vec<&LatestPackage> = catalog
+            .values()
+            .filter(|l| l.family.eq_ignore_ascii_case("windows"))
+            .filter(|l| !installed.contains(&l.name.to_lowercase()))
+            .collect();
+        avail.sort_by(|a, b| a.name.cmp(&b.name));
+        for l in avail {
+            rows.push(PkgRow {
+                name: l.name.clone(),
+                installed: String::new(),
+                arch: l.arch.clone(),
+                source: l.repo.clone(),
+                latest: Some(l.version.clone()),
+                update_available: true,
+                policy: if policy_allows_local(&policy, &l.name) {
+                    "allow".to_string()
+                } else {
+                    "deny".to_string()
+                },
+            });
+        }
+    }
     rows.sort_by(|a, b| a.name.cmp(&b.name));
 
     Json(serde_json::json!({
@@ -608,6 +666,8 @@ pub struct SourceBody {
     pub kind: String,
     pub base_url: String,
     pub suite: Option<String>,
+    #[serde(default)]
+    pub kbs: Option<Vec<String>>,
 }
 
 pub async fn add_source(
@@ -622,15 +682,30 @@ pub async fn add_source(
     if b.name.trim().is_empty() || b.base_url.trim().is_empty() {
         return err(StatusCode::BAD_REQUEST, "name and base_url are required");
     }
-    if !matches!(b.kind.as_str(), "apt" | "dnf" | "none") {
-        return err(StatusCode::BAD_REQUEST, "kind must be 'apt', 'dnf' or 'none'");
+    if !matches!(b.kind.as_str(), "apt" | "dnf" | "wucatalog" | "none") {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "kind must be 'apt', 'dnf', 'wucatalog' or 'none'",
+        );
     }
+    if b.kind == "wucatalog" && b.family.to_lowercase() != "windows" {
+        return err(StatusCode::BAD_REQUEST, "wucatalog sources must use family 'windows'");
+    }
+    let kbs: Vec<String> = b
+        .kbs
+        .unwrap_or_default()
+        .iter()
+        .map(|k| sanitize_str(k, 50))
+        .filter(|k| !k.trim().is_empty())
+        .map(|k| k.trim().to_uppercase())
+        .collect();
     let source = Source {
         name: sanitize_str(&b.name, 100),
         family: sanitize_str(&b.family, 50),
         kind: b.kind.clone(),
         base_url: sanitize_str(&b.base_url, 500),
         suite: sanitize_str(b.suite.as_deref().unwrap_or(""), 100),
+        kbs,
         enabled: true,
     };
     st.store.upsert_source(source).await;
@@ -1010,21 +1085,28 @@ pub async fn request_update(
         return err(StatusCode::BAD_REQUEST, "device has no inventory");
     };
     let key = req.package.to_lowercase();
-    let Some(installed) = inv
+    let family = format!("{:?}", inv.family).to_lowercase();
+    let is_windows = family == "windows";
+    let installed = inv
         .packages
         .iter()
-        .find(|p| p.name.to_lowercase() == key)
-    else {
+        .find(|p| p.name.to_lowercase() == key);
+    if installed.is_none() && !is_windows {
         return err(StatusCode::NOT_FOUND, "package not installed on device");
-    };
+    }
+    // Windows updates are tracked by KB membership: installing a KB that is
+    // already present is a no-op, so refuse the approval.
+    if is_windows && installed.is_some() {
+        return err(StatusCode::BAD_REQUEST, "update already installed on device");
+    }
     let Some(latest) = st
         .catalog
-        .latest(&key, &format!("{:?}", inv.family).to_lowercase())
+        .latest(&key, &family)
         .await
     else {
         return err(StatusCode::NOT_FOUND, "no upstream package known - refresh catalog first");
     };
-    if latest.version == installed.version {
+    if !is_windows && latest.version == installed.unwrap().version {
         return err(StatusCode::BAD_REQUEST, "already up to date");
     }
     if !st.store.policy_allows(&key).await {
@@ -1039,7 +1121,7 @@ pub async fn request_update(
         id: format!("{}-{}-{}", req.agent_id, key, ts),
         agent_id: req.agent_id,
         package: req.package,
-        from_version: installed.version.clone(),
+        from_version: installed.map(|p| p.version.clone()).unwrap_or_default(),
         to_version: latest.version,
         ring: "dev".to_string(),
         ts,
@@ -1317,7 +1399,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       <div class="headline"><h2>Upstream sources</h2><span class="muted">whitelist where the catalog may download from; only enabled sources are synced</span></div>
       <div class="empty" id="srcEmpty" style="display:none">No sources configured. Add at least one apt or dnf source so the catalog sync has something to fetch.</div>
       <table style="margin-top:12px">
-        <thead><tr><th>Name</th><th>Family</th><th>Kind</th><th>Base URL</th><th>Suite</th><th>Status</th><th></th></tr></thead>
+        <thead><tr><th>Name</th><th>Family</th><th>Kind</th><th>Base URL</th><th>Suite</th><th>KBs</th><th>Status</th><th></th></tr></thead>
         <tbody id="srcBody"></tbody>
       </table>
       <div class="card" style="margin-top:16px;cursor:default">
@@ -1333,13 +1415,15 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
           <select id="srcKind">
             <option value="apt">apt</option>
             <option value="dnf">dnf</option>
+            <option value="wucatalog">wucatalog (Microsoft Update Catalog)</option>
             <option value="none">none (stored only)</option>
           </select>
           <input id="srcUrl" placeholder="base URL, e.g. http://host/repo" style="flex:1;min-width:240px">
           <input id="srcSuite" placeholder="suite (apt only, e.g. noble)">
+          <input id="srcKbs" placeholder="KB list (wucatalog only, comma-separated, e.g. KB5039227)">
           <button onclick="addSource()">Save source</button>
         </div>
-        <p class="muted" style="margin:8px 0 0;font-size:11px">apt sources need the base URL + suite (components main/universe, arch amd64). dnf sources need the base URL of the repo dir. "none" lets you whitelist a future source (e.g. a Windows/WSUS mirror) without syncing it yet.</p>
+        <p class="muted" style="margin:8px 0 0;font-size:11px">apt sources need the base URL + suite (components main/universe, arch amd64). dnf sources need the base URL of the repo dir. wucatalog sources are the Windows answer to WSUS: point at the Microsoft Update Catalog and list the KBs to track - the server syncs them and serves the .msu to agents, no separate update service required. "none" stores a source without syncing it yet.</p>
       </div>
     </div>
 
@@ -1683,7 +1767,7 @@ async function refreshCatalog(){
   }, 1500);
   try{
     const r = await api('/api/refresh', {method:'POST'});
-    toast('Catalog refreshed: '+r.packages+' packages (apt '+r.apt+', dnf '+r.dnf+')', 'ok');
+    toast('Catalog refreshed: '+r.packages+' packages (apt '+r.apt+', dnf '+r.dnf+(r.windows?', windows '+r.windows:'')+')', 'ok');
     loadDevices();
   }catch(e){
     toast('Refresh failed: '+e.message, 'err');
@@ -1899,6 +1983,7 @@ async function loadSources(){
         <td><span class="badge bg-idle">${esc(s.kind)}</span></td>
         <td class="mut" style="word-break:break-all">${esc(s.base_url)}</td>
         <td class="mut">${esc(s.suite)||'&ndash;'}</td>
+        <td class="mut">${esc((s.kbs||[]).join(', '))||'&ndash;'}</td>
         <td>${s.enabled?'<span class="badge bg-online">enabled</span>':'<span class="badge bg-idle">disabled</span>'}</td>
         <td style="white-space:nowrap">
           <button class="ghost" onclick="toggleSource('${esc(s.name)}', ${!s.enabled})">${s.enabled?'Disable':'Enable'}</button>
@@ -1914,11 +1999,12 @@ async function addSource(){
   const family = $('#srcFamily').value;
   const kind = $('#srcKind').value;
   const suite = $('#srcSuite').value.trim();
+  const kbs = $('#srcKbs').value.split(',').map(s=>s.trim().toUpperCase()).filter(Boolean);
   if(!name || !url){ toast('Name and base URL are required', 'err'); return; }
   try{
-    await api('/api/sources', {method:'POST', body: JSON.stringify({name, family, kind, base_url: url, suite})});
+    await api('/api/sources', {method:'POST', body: JSON.stringify({name, family, kind, base_url: url, suite, kbs})});
     toast('Source '+name+' saved', 'ok');
-    $('#srcName').value=''; $('#srcUrl').value=''; $('#srcSuite').value='';
+    $('#srcName').value=''; $('#srcUrl').value=''; $('#srcSuite').value=''; $('#srcKbs').value='';
     loadSources();
   }catch(e){ toast('Save failed: '+e.message, 'err'); }
 }

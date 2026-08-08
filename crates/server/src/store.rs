@@ -60,8 +60,10 @@ pub struct Policy {
 }
 
 /// A whitelisted upstream source that the catalog may sync from.
-/// `kind` is "apt", "dnf" or "none" (the latter stores a source without
-/// syncing, e.g. a future Windows/WSUS mirror). `suite` is used by apt only.
+/// `kind` is "apt", "dnf", "wucatalog" (Microsoft Update Catalog, Windows)
+/// or "none" (the latter stores a source without syncing). `suite` is used
+/// by apt only. `kbs` is an allowlist of KB identifiers used by wucatalog
+/// sources - only those updates are synced into the catalog.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Source {
     pub name: String,
@@ -70,6 +72,8 @@ pub struct Source {
     pub base_url: String,
     #[serde(default)]
     pub suite: String,
+    #[serde(default)]
+    pub kbs: Vec<String>,
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
@@ -165,6 +169,7 @@ fn default_sources() -> Vec<Source> {
             kind: "apt".to_string(),
             base_url: "http://archive.ubuntu.com/ubuntu".to_string(),
             suite: "noble".to_string(),
+            kbs: Vec::new(),
             enabled: true,
         },
         Source {
@@ -173,6 +178,7 @@ fn default_sources() -> Vec<Source> {
             kind: "apt".to_string(),
             base_url: "http://archive.ubuntu.com/ubuntu".to_string(),
             suite: "noble-updates".to_string(),
+            kbs: Vec::new(),
             enabled: true,
         },
         Source {
@@ -181,6 +187,7 @@ fn default_sources() -> Vec<Source> {
             kind: "apt".to_string(),
             base_url: "http://security.ubuntu.com/ubuntu".to_string(),
             suite: "noble-security".to_string(),
+            kbs: Vec::new(),
             enabled: true,
         },
         Source {
@@ -189,6 +196,7 @@ fn default_sources() -> Vec<Source> {
             kind: "dnf".to_string(),
             base_url: "http://mirror.rackspace.com/rocky/8/BaseOS/x86_64/os".to_string(),
             suite: String::new(),
+            kbs: Vec::new(),
             enabled: true,
         },
         Source {
@@ -197,7 +205,17 @@ fn default_sources() -> Vec<Source> {
             kind: "dnf".to_string(),
             base_url: "http://mirror.rackspace.com/rocky/8/AppStream/x86_64/os".to_string(),
             suite: String::new(),
+            kbs: Vec::new(),
             enabled: true,
+        },
+        Source {
+            name: "windows-update-catalog".to_string(),
+            family: "windows".to_string(),
+            kind: "wucatalog".to_string(),
+            base_url: "https://www.catalog.update.microsoft.com".to_string(),
+            suite: String::new(),
+            kbs: Vec::new(),
+            enabled: false,
         },
     ]
 }
