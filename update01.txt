@@ -1,0 +1,150 @@
+OPENUPDATER - STATUS UPDATE #01
+===============================
+1) LATEST PLAN: AIR-GAP SYSTEM
+2) LATEST PLAN: WIRED SYSTEM
+3) WORK DONE SO FAR: WIRELESS SYSTEM
+====================================
+
+============================================
+1. LATEST PLAN - THE AIR-GAP SYSTEM
+============================================
+Reference docs: PLAN.txt, RESUME.txt (the two-zone design), plan.md.
+
+GOAL (unchanged)
+  A WSUS-style secure update platform for a DevOps network so machines
+  stay completely isolated from the internet while still receiving OS +
+  software updates that are automatically downloaded, tested, approved,
+  and distributed through a central server.
+
+TOPOLOGY (two-zone, fully air-gapped)
+  - ZONE A  = internet ingest + bundle builder. Only zone allowed online.
+  - ZONE B  = air-gapped core server + clients. No internet, ever.
+  - CONDUIT = the ONLY connection between the zones, and it is
+    interchangeable: sneakernet/USB or a one-way data diode.
+  - TRANSFER BUNDLE is the contract that makes the conduit swappable:
+      catalog.json  (what is available, versions, metadata)
+      artifacts/    (the actual packages / bundles)
+      manifest.json (inventory of the bundle)
+      manifest.sig  (signature; agents verify locally before anything runs)
+  - Earlier single-box "server online, agents offline" (WSUS-relay) is the
+    WIRED variant (section 2); the two-zone/diode design above is the true
+    air-gap variant and remains the authoritative PLAN.txt architecture.
+
+ZONE B CORE SERVER (WSUS analog)
+  - Validator: verifies signatures + integrity of everything crossing the conduit.
+  - Approval service + admin UI: human gate before anything is released.
+  - Internal repos: aptly (apt) / zot (containers) / MinIO (bundles).
+  - Rings: dev -> staging -> prod, per-package/per-bundle approval.
+  - Immutable audit log + RBAC.
+
+ZONE B CLIENT AGENT
+  - Small systemd unit, verifies manifest.sig locally, stages, applies,
+    auto-rolls-back on failure, reports.
+
+PLANNED MILESTONES (from PLAN.txt, in order)
+  M0  skeleton: proto, mTLS CA, enroll/register/inventory       DONE
+  M1  apt+dnf mirroring, agents repointed at server IP,
+      per-ring approval gating, install + report               DONE (wired lab)
+  M2  source policy engine (allowlist default-deny + blacklist) DONE (server)
+  M3  generic bundles (install/verify/rollback hooks) + git-pull
+  M4  test host: VM sandbox boot -> apply -> verify gate before release
+  M5  kernel/bootloader alternate-boot-entry testing + rollback
+  M6  dashboard, scheduling, reports, audit
+  M7  Windows agent                                          DONE (KB-based)
+
+SUGGESTED NEXT AIR-GAP STEPS (from RESUME.txt, unfinished)
+  1. Lock down the transfer-bundle schema as a spec (docs/bundle-schema.md).
+  2. Build PoC: Zone A builder -> USB -> verify/ingest on a VM.
+  3. Add agent + rings to the two-zone flow.
+
+============================================
+2. LATEST PLAN - THE WIRED SYSTEM
+============================================
+Reference docs: PLAN.txt section 3, MANUAL.txt, plan.md, PROGRESS.txt.
+
+DESIGN (single-server WSUS-relay, wired)
+  - The update server is the ONLY machine online.
+  - Agents (Rocky/Alma/RHEL, Ubuntu/Debian, Windows) live on an isolated
+    host-only subnet with NO default route; they can only reach the server.
+  - All update traffic flows THROUGH the server, by IP, over mTLS.
+  - Source policy engine sits in front of every outbound fetch:
+    ALLOWLIST (default-deny) + BLACKLIST, global across all source types,
+    unknown hosts blocked + flagged for admin review, full audit log.
+
+SERVER (Rust, crates/server)
+  - Internal CA issuing per-agent mTLS client certs (CN = agent_id).
+  - mTLS API on :8443: /enroll /register /inventory /updates /report /artifact.
+  - Dashboard + JSON API on :8080 (plain HTTP): devices, packages vs latest,
+    approvals, rings/promote, catalog search, sources, policy, operators,
+    provisioning (network sweep + SSH push of agent + CA), audit log.
+  - Catalog sync (crates/server/src/catalog.rs): apt (Ubuntu noble) + dnf
+    (Rocky 8) metadata -> catalog.json keyed family/name. IPv4 resolution
+    pinned for upstream hosts.
+  - Windows updates WITHOUT WSUS: wucatalog source syncs the Microsoft
+    Update Catalog for a KB allowlist; MSUs are served over mTLS from a
+    local dropbox (<store>/windows/). KB-membership based availability.
+  - Native mirrors per ring = the WSUS approval gate (approved-only repos).
+
+AGENT (Rust, crates/agent)
+  - Cross-platform static binary (musl; Windows gnu target).
+  - Enroll once with token -> client cert; reuse cert on later runs.
+  - Inventory: os-release, rpm/dpkg package list (Get-HotFix on Windows),
+    kernel, bootloader, repos.
+  - Poll loop (default 60s) -> pulls approved artifacts over mTLS /artifact
+    -> installs OFFLINE in one transaction:
+      RHEL:   dnf -y install --disablerepo=* ... --nogpgcheck <rpms>
+      Debian: dpkg -i <debs>
+      Windows: wusa.exe <msu> /quiet /norestart (DISM SSU->LCU fallback)
+    -> reports outcome -> re-collects inventory.
+
+STATUS OF WIRED SYSTEM (all DONE + verified live in the lab)
+  - M0 skeleton committed (0ffffe0), dashboard+catalog+approvals (ddc03b1),
+    Windows Update Catalog tranche committed 459b904.
+  - Deployed: server on 172.16.5.20 (/var/lib/airgap-server, PID 3775),
+    3 agents online (rocky 172.16.5.21, ubu 172.16.5.22, win 172.16.5.23).
+  - Verified end-to-end for Windows: staged genuine MSU KB5039227 in the
+    dropbox -> catalog indexed it -> device showed update_available -> admin
+    approved -> agent downloaded the 384 MB MSU over mTLS -> installed via
+    DISM (SSU then LCU, because the base 20348.587 build was too old for
+    wusa) -> reboot -> build 20348.2527, KB confirmed in wmic qfe list.
+  - Build/test: cargo build --release (gnu + musl) OK; cargo test -> 3 passed.
+  - MANUAL.txt updated with the full procedure + limitations.
+
+WIRED NEXT STEPS
+  - Make the agent install path automatic (wusa MSU with embedded SSU on
+    old builds) so DISM is not a manual step.
+  - True apt/dnf native mirrors + ring channels (M1 full form).
+  - Content signing of artifacts.
+
+============================================
+3. WORK DONE SO FAR - THE WIRELESS SYSTEM
+============================================
+STATUS: NO WIRELESS IMPLEMENTATION EXISTS YET.
+
+  - A grep of the entire repo for wireless / wifi / wi-fi / WLAN /
+    802.11 / radio / 5G / 4G / cellular finds NO code, plan, or doc
+    file about a wireless variant.
+  - PLAN.txt, plan.md, PROGRESS.txt, STACK.txt, RESUME.txt, EXPLAINER.md
+    and MANUAL.txt all describe only the wired host-only topology
+    (172.16.5.0/24) and the two-zone conduit design (USB/diode).
+  - No commits, branches, or code touch a wireless agent/server.
+
+WHAT THE WIRELESS VARIANT WOULD BE (scope inferred, NOT agreed/started)
+  - Same trust model over Wi-Fi: server = online relay, agents talk to it
+    only via mTLS; no direct internet for wireless nodes.
+  - Likely additions if pursued:
+      * agents/servers connected over Wi-Fi (access point / mesh) instead
+        of wired host-only networking,
+      * provisioning + artifact delivery over the wireless link,
+      * possibly Wi-Fi specific concerns: radio isolation, EAP/PSK
+        segmentation so wireless nodes stay on the isolated subnet,
+        and throttling large MSU/MIRROR downloads over the air.
+  - NONE of this has been designed or built.
+
+So: the wireless system has had zero work done so far. It is a discussed
+idea only; the air-gap (two-zone) and wired (single relay) systems are
+fully planned, and the wired system is implemented and verified.
+
+============================================
+END OF UPDATE #01
+============================================
