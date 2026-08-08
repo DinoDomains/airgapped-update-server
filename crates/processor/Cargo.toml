@@ -3,6 +3,7 @@ name = "airgap-processor"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "M3: Update Server core (online) — vendor catalog, download+verify, behavior gate, bundle signing, OUTBOUND reader, INBOUND writer"
 
 [[bin]]
 name = "airgap-processor"
@@ -16,13 +17,12 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 reqwest = { workspace = true }
 airgap-proto = { path = "../proto" }
-airgap-transport = { path = "../transport" }
+airgap-contracts = { path = "../contracts" }
+airgap-keys = { path = "../keys" }
 airgap-sandbox = { path = "../sandbox" }
 clap = { workspace = true }
 chrono = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
-ed25519-dalek = { version = "2", features = ["rand_core"] }
 base64 = "0.22"
-rand = { workspace = true }
 tracing-subscriber = { workspace = true }

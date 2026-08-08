@@ -91,15 +91,14 @@ dependencies = [
 name = "airgap-processor"
 version = "0.1.0"
 dependencies = [
+ "airgap-contracts",
+ "airgap-keys",
  "airgap-proto",
  "airgap-sandbox",
- "airgap-transport",
  "base64",
  "chrono",
  "clap",
- "ed25519-dalek",
  "hex",
- "rand 0.8.7",
  "reqwest",
  "serde",
  "serde_json",

@@ -1,8 +1,10 @@
 # OpenUpdater — Air-Gapped Update System PLAN
 
-Status: design plan, not yet fully implemented. Wired single-server system
-is already built and verified (see PROGRESS.txt / MANUAL.txt). This document
-supersedes prior air-gap notes for the three-module design below.
+Status: design plan. Wired single-server system is built and verified
+(see PROGRESS.txt / MANUAL.txt). Implementation of the three-module design:
+M1 (bundle schema/contracts) DONE, M2 (keys) DONE, M3 (Update Server core)
+DONE, M4–M8 pending. This document supersedes prior air-gap notes for the
+three-module design below.
 
 ---
 

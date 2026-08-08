@@ -147,8 +147,10 @@ impl DriveAttestation {
     }
 
     /// Write the three envelope files. Used by the writer side (EXPORT VM
-    /// for outbound; Update Server for inbound).
+    /// for outbound; Update Server for inbound). Creates the drive root if
+    /// needed.
     pub fn write(&self, drive_root: &Path) -> Result<(), ContractError> {
+        fs::create_dir_all(drive_root)?;
         fs::write(drive_root.join("drive_id.txt"), &self.drive_id)?;
         fs::write(
             drive_root.join("direction.txt"),
@@ -402,6 +404,22 @@ pub struct InboundBundle {
 }
 
 impl InboundBundle {
+    /// Build an InboundBundle in memory from a catalog + attestation +
+    /// a staging dir of artifact files (names become the manifest paths).
+    /// The manifest is derived by hashing every file in `stage`.
+    pub fn build_from(
+        catalog: &InboundCatalog,
+        attestation: &DriveAttestation,
+        stage_dir: &Path,
+    ) -> Result<InboundBundle, ContractError> {
+        let manifest = InboundManifest::build(catalog.session, catalog, stage_dir)?;
+        Ok(InboundBundle {
+            attestation: attestation.clone(),
+            catalog: catalog.clone(),
+            manifest,
+        })
+    }
+
     /// Write the full inbound bundle. `artifacts_dir` holds the artifact files
     /// that are copied into `drive_root/artifacts/`.
     pub fn write(

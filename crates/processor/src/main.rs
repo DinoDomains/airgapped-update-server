@@ -11,5 +11,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let cli = Cli::parse();
-    run_processor(cli).await
+    run_processor(cli).await?;
+    Ok(())
 }
