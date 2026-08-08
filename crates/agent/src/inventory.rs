@@ -97,7 +97,7 @@ fn os_release() -> BTreeMap<String, String> {
             .args([
                 "-NoProfile",
                 "-Command",
-                "(Get-CimInstance Win32_OperatingSystem) | Select-Object Caption,Version,BuildNumber | ConvertTo-Json",
+                "Get-WmiObject Win32_OperatingSystem | Select-Object Caption,Version,BuildNumber | ConvertTo-Json",
             ])
             .output()
         {
@@ -157,7 +157,7 @@ fn collect_packages_windows() -> Vec<Package> {
         .args([
             "-NoProfile",
             "-Command",
-            "Get-HotFix | Select-Object HotFixID,InstalledOn,Description | ConvertTo-Json",
+            "Get-HotFix | Select-Object @{n='HotFixID';e={$_.HotFixID}},@{n='InstalledOn';e={$_.InstalledOn.ToString('yyyy-MM-dd')}},@{n='Description';e={$_.Description}} | ConvertTo-Json",
         ])
         .output()
     {

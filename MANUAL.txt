@@ -245,6 +245,31 @@ PROVISION AN AGENT (isolated machine)
     AIRGAP_ENROLL_TOKEN                only needed on first enroll
     AIRGAP_POLL_INTERVAL seconds between polls   DEFAULT: 60 (0 = one-shot)
 
+WINDOWS AGENT (Server Core VM)
+------------------------------
+  Build the Windows binary (cross-compile):
+    cargo build --release --target x86_64-pc-windows-gnu -p airgap-agent
+  Deploy C:\ProgramData\airgap-agent.exe plus the server CA at
+  C:\ProgramData\airgap-agent\ca.pem. Set machine env vars, then start:
+    [Environment]::SetEnvironmentVariable('AIRGAP_SERVER','https://<server-ip>:8443','Machine')
+    [Environment]::SetEnvironmentVariable('AIRGAP_STATE_DIR','C:\ProgramData\airgap-agent','Machine')
+    Start-Process C:\ProgramData\airgap-agent.exe
+  The agent enrolls with the same mTLS flow; state dir gets client.pem,
+  client-key.pem and agent-id. Persistence via RunOnce or a scheduled task.
+  Windows inventory: OS caption/version via Get-WmiObject Win32_OperatingSystem
+  (Get-CimInstance fails on some Server Core builds), packages = KB hotfixes
+  from Get-HotFix, family=Windows, arch AMD64. Approved updates install via
+  wusa.exe <artifact> /quiet /norestart (MSU artifacts).
+  Lab notes (VMware, host-only 172.16.5.0/24):
+    - Give every VM a UNIQUE static MAC - a duplicate MAC silently breaks
+      vmnet1 connectivity (ARP incomplete, sshd/WinRM unreachable).
+    - Register the OpenSSH server service manually if install-sshd.ps1 fails:
+      hivexregedit the SYSTEM hive (Services\sshd: Start=2, ImagePath).
+    - Disable the Windows firewall profile if SYN packets are silently
+      dropped even with an allow rule.
+    - scp needs the sftp Subsystem line pointing at the absolute path of
+      sftp-server.exe (the sshd service PATH does not include the OpenSSH dir).
+
 HOW APPROVED UPDATES GET INSTALLED
 ----------------------------------
   1. The catalog records the upstream artifact path for every package it
