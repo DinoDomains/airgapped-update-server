@@ -36,117 +36,148 @@ fn is_safe_package(name: &str) -> bool {
         && name.chars().all(|c| c.is_ascii_alphanumeric() || "+._-".contains(c))
 }
 
-/// Applies a single approved update. For "package" updates the agent fetches
-/// the artifact (.rpm/.deb/.msu/.cab) from the server over mTLS, writes it to the
-/// state directory, then installs it from the local file so no direct
-/// internet access is needed:
-///   - RHEL:    dnf -y install --disablerepo=* <file.rpm>
-///   - Debian:  dpkg -i <file.deb>
-///   - Windows: wusa.exe /quiet /norestart <file.msu> (or .cab via DISM)
-/// Returns (status code, detail): "ok" when the install succeeded, "failed"
-/// otherwise. Detail carries the resulting installed version or the tail of
-/// the package manager output.
-async fn apply_update(
+/// Downloads the artifacts for a batch of approved updates and installs them
+/// in a single package-manager transaction so cross-package dependencies
+/// (e.g. coreutils -> coreutils-common) resolve offline. Returns one
+/// (update_id, code, detail) triple per update.
+async fn apply_updates_batch(
     client: &client::Client,
     agent_id: &str,
     state_dir: &PathBuf,
-    update: &UpdateItem,
-) -> (String, String) {
-    if update.kind != "package" {
-        return ("skipped".to_string(), format!("unsupported kind {}", update.kind));
-    }
-    let pkg = &update.title;
-    if !is_safe_package(pkg) {
-        return ("failed".to_string(), "invalid package name".to_string());
-    }
+    updates: &[UpdateItem],
+) -> Vec<(String, String, String)> {
     let inv = inventory::collect().await;
-    let family = match inv.family {
-        DistroFamily::Debian => "debian",
-        DistroFamily::Rhel => "rhel",
-        DistroFamily::Windows => "windows",
-        other => {
-            return (
-                "failed".to_string(),
-                format!("no package installer for {other:?}"),
-            )
-        }
-    };
+    let family = inv.family;
+    let mut results: Vec<(String, String, String)> = Vec::new();
+    let mut staged: Vec<(String, String, PathBuf)> = Vec::new(); // (id, pkg, path)
 
-    let artifact = match client.artifact(agent_id, &update.id, family).await {
-        Ok(a) => a,
-        Err(e) => {
-            return ("failed".to_string(), format!("artifact fetch failed: {e}"))
+    for update in updates {
+        if update.kind != "package" {
+            results.push((
+                update.id.clone(),
+                "skipped".to_string(),
+                format!("unsupported kind {}", update.kind),
+            ));
+            continue;
         }
-    };
-    let filename = if artifact
-        .filename
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || "._+-".contains(c))
-        && !artifact.filename.is_empty()
-        && artifact.filename.len() <= 200
-    {
-        artifact.filename.clone()
-    } else {
-        let ext = if family == "debian" {
-            "deb"
-        } else if family == "windows" {
-            "msu"
-        } else {
-            "rpm"
+        let pkg = &update.title;
+        if !is_safe_package(pkg) {
+            results.push((update.id.clone(), "failed".to_string(), "invalid package name".to_string()));
+            continue;
+        }
+        let fam = match family {
+            DistroFamily::Debian => "debian",
+            DistroFamily::Rhel => "rhel",
+            DistroFamily::Windows => "windows",
+            other => {
+                results.push((
+                    update.id.clone(),
+                    "failed".to_string(),
+                    format!("no package installer for {other:?}"),
+                ));
+                continue;
+            }
         };
-        format!("update-{}.{}", update.id, ext)
-    };
-    let path = state_dir.join(filename);
-    if let Err(e) = std::fs::write(&path, &artifact.bytes) {
-        return ("failed".to_string(), format!("write artifact: {e}"));
+        let artifact = match client.artifact(agent_id, &update.id, fam).await {
+            Ok(a) => a,
+            Err(e) => {
+                results.push((update.id.clone(), "failed".to_string(), format!("artifact fetch failed: {e}")));
+                continue;
+            }
+        };
+        let filename = if artifact
+            .filename
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._+-".contains(c))
+            && !artifact.filename.is_empty()
+            && artifact.filename.len() <= 200
+        {
+            artifact.filename.clone()
+        } else {
+            let ext = if family == DistroFamily::Debian {
+                "deb"
+            } else if family == DistroFamily::Windows {
+                "msu"
+            } else {
+                "rpm"
+            };
+            format!("update-{}.{}", update.id, ext)
+        };
+        let path = state_dir.join(filename);
+        if let Err(e) = std::fs::write(&path, &artifact.bytes) {
+            results.push((update.id.clone(), "failed".to_string(), format!("write artifact: {e}")));
+            continue;
+        }
+        staged.push((update.id.clone(), pkg.clone(), path));
     }
 
-    let (cmd, args) = match inv.family {
-        DistroFamily::Debian => ("dpkg", vec!["-i", path.to_str().unwrap_or_default()]),
-        DistroFamily::Windows => (
-            "wusa.exe",
-            vec![
-                path.to_str().unwrap_or_default(),
-                "/quiet",
-                "/norestart",
-            ],
-        ),
+    if staged.is_empty() {
+        return results;
+    }
+
+    // Windows wusa accepts one MSU per invocation - run them one at a time.
+    if family == DistroFamily::Windows {
+        for (id, pkg, path) in staged {
+            let output = std::process::Command::new("wusa.exe")
+                .args([path.to_str().unwrap_or_default(), "/quiet", "/norestart"])
+                .output();
+            let new_inv = inventory::collect().await;
+            let new_version = new_inv
+                .packages
+                .iter()
+                .find(|p| p.name.eq_ignore_ascii_case(&pkg))
+                .map(|p| p.version.clone())
+                .unwrap_or_default();
+            let (code, detail) = match output {
+                Ok(out) if out.status.success() => ("ok".to_string(), format!("installed {new_version}")),
+                Ok(out) => {
+                    let tail: String = String::from_utf8_lossy(&out.stderr)
+                        .lines()
+                        .rev()
+                        .take(8)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    ("failed".to_string(), tail)
+                }
+                Err(e) => ("failed".to_string(), format!("spawn failed: {e}")),
+            };
+            results.push((id, code, detail));
+        }
+        return results;
+    }
+
+    // Linux: one transaction with every staged file so cross-package deps
+    // (and package groups) resolve from local artifacts with repos disabled.
+    let (cmd, mut args) = match family {
+        DistroFamily::Debian => ("dpkg", vec!["-i".to_string()]),
         _ => (
             "dnf",
             vec![
-                "-y",
-                "install",
-                "--disablerepo=*",
-                path.to_str().unwrap_or_default(),
+                "-y".to_string(),
+                "install".to_string(),
+                "--disablerepo=*".to_string(),
+                "--setopt=*_skip_if_unavailable=1".to_string(),
+                "--nogpgcheck".to_string(),
             ],
         ),
     };
-    tracing::info!("applying {pkg} via {cmd} from {}", path.display());
+    for (_id, _pkg, path) in &staged {
+        args.push(path.to_str().unwrap_or_default().to_string());
+    }
+    let names: Vec<&str> = staged.iter().map(|s| s.1.as_str()).collect();
+    tracing::info!("applying {} update(s) via {cmd}: {}", staged.len(), names.join(", "));
     let output = std::process::Command::new(cmd)
         .args(&args)
         .env("DEBIAN_FRONTEND", "noninteractive")
         .output();
 
-    let new_inv = inventory::collect().await;
-    let new_version = new_inv
-        .packages
-        .iter()
-        .find(|p| p.name.eq_ignore_ascii_case(pkg))
-        .map(|p| p.version.clone())
-        .unwrap_or_default();
-
-    match output {
-        Ok(out) if out.status.success() => {
-            let detail = if new_version.is_empty() {
-                format!("{} reported success", cmd)
-            } else {
-                format!("installed {}", new_version)
-            };
-            ("ok".to_string(), detail)
-        }
+    let (ok_all, err_tail) = match output {
+        Ok(out) if out.status.success() => (true, String::new()),
         Ok(out) => {
-            let err = String::from_utf8_lossy(&out.stderr);
-            let tail: String = err
+            let tail: String = String::from_utf8_lossy(&out.stderr)
                 .lines()
                 .rev()
                 .take(8)
@@ -155,10 +186,28 @@ async fn apply_update(
                 .rev()
                 .collect::<Vec<_>>()
                 .join(" | ");
-            ("failed".to_string(), tail)
+            (false, tail)
         }
-        Err(e) => ("failed".to_string(), e.to_string()),
+        Err(e) => (false, format!("spawn failed: {e}")),
+    };
+
+    let new_inv = inventory::collect().await;
+    for (id, pkg, _path) in &staged {
+        let new_version = new_inv
+            .packages
+            .iter()
+            .find(|p| p.name.eq_ignore_ascii_case(&pkg))
+            .map(|p| p.version.clone())
+            .unwrap_or_default();
+        if ok_all && !new_version.is_empty() {
+            results.push((id.to_string(), "ok".to_string(), format!("installed {new_version}")));
+        } else if ok_all {
+            results.push((id.to_string(), "ok".to_string(), "install reported success".to_string()));
+        } else {
+            results.push((id.to_string(), "failed".to_string(), err_tail.clone()));
+        }
     }
+    results
 }
 
 async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
@@ -211,19 +260,19 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
             tracing::info!("scan complete - inventory re-reported");
         }
 
-        for update in &poll.updates {
-            let (code, detail) = apply_update(&client, &agent_id, &state_dir, update).await;
-            tracing::info!("update {} -> {}", update.title, code);
-            client
-                .report(&ReportRequest {
-                    agent_id: agent_id.clone(),
-                    update_id: update.id.clone(),
-                    status: ReportStatus {
-                        code: code.clone(),
-                        detail,
-                    },
-                })
-                .await?;
+        if !poll.updates.is_empty() {
+            let results =
+                apply_updates_batch(&client, &agent_id, &state_dir, &poll.updates).await;
+            for (update_id, code, detail) in results {
+                tracing::info!("update {update_id} -> {code}");
+                client
+                    .report(&ReportRequest {
+                        agent_id: agent_id.clone(),
+                        update_id,
+                        status: ReportStatus { code, detail },
+                    })
+                    .await?;
+            }
             let fresh = inventory::collect().await;
             client
                 .inventory(&InventoryRequest {

@@ -284,21 +284,25 @@ HOW APPROVED UPDATES GET INSTALLED
      source, downloads it upstream (the server is the only online host), and
      streams the bytes back. First fetch is cached in
      <AIRGAP_STORE_DIR>/artifacts/<update_id>.
-  4. The agent writes the file to its state dir and installs it fully
-     offline:
-       - RHEL:   dnf -y install --disablerepo=* <file.rpm>
-                 (disables all repos; dependencies resolve against the
-                 installed RPM database, so the agent never touches the
-                 internet)
-       - Debian: dpkg -i <file.deb>
-                 (offline; works when the package's dependencies are already
-                 satisfied - otherwise the install fails and the report shows
-                 the dpkg error)
-  5. The agent reports the outcome (code ok/failed + detail, usually the
-     newly installed version), the request becomes done/failed, and the agent
-     re-collects its inventory so the dashboard shows the new version.
-     A failed metadata/DNS error means the agent was running an old binary;
-     re-provision it (the provision script now restarts the agent).
+   4. The agent writes each file to its state dir, then installs ALL offered
+      artifacts in a SINGLE package-manager transaction (offline):
+        - RHEL:   dnf -y install --disablerepo=* --setopt=*_skip_if_unavailable=1 \
+                     --nogpgcheck <file1.rpm> <file2.rpm> ...
+                  (all repos disabled + unavailable repos skipped, so the agent
+                  never touches the internet; batching every artifact in one
+                  transaction lets cross-package dependencies resolve from the
+                  local files, e.g. coreutils needs coreutils-common updated
+                  in the same transaction)
+        - Debian: dpkg -i <file1.deb> <file2.deb> ...
+                  (offline; works when the packages' dependencies are already
+                  satisfied - otherwise the install fails and the report shows
+                  the dpkg error)
+        - Windows: wusa.exe <file.msu> /quiet /norestart  (one MSU at a time)
+   5. The agent reports the outcome per update (code ok/failed + detail,
+      usually the newly installed version), the requests become done/failed,
+      and the agent re-collects its inventory so the dashboard shows the new
+      version. A failed metadata/DNS error means the agent was running an old
+      binary; re-provision it (the provision script now restarts the agent).
 
 VERIFY / MANUAL TEST
 --------------------
