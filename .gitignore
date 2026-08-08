@@ -4,3 +4,9 @@
 /data/
 *.log
 .DS_Store
+
+# signing/verifying key material (never commit keys)
+*/*-signing-key
+*/*-verifying-key.pub
+*/*-key-meta.json
+/keys/*/

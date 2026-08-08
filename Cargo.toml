@@ -8,6 +8,8 @@ members = [
     "crates/transport",
     "crates/collector",
     "crates/processor",
+    "crates/contracts",
+    "crates/keys",
 ]
 
 [workspace.package]
