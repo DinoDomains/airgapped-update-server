@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
@@ -70,7 +71,10 @@ impl Client {
             let resp = enroll_http(&Self::bootstrap_client(&ca_cert), server, &enroll).await?;
             std::fs::write(&cert_path, &resp.cert)?;
             std::fs::write(&key_path, &resp.cert_key)?;
-            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
+            #[cfg(unix)]
+            {
+                std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
+            }
             std::fs::write(state_dir.join("agent-id"), &resp.agent_id)?;
             Self::load_identity(&cert_path, &key_path)?
         };
@@ -185,10 +189,16 @@ impl Client {
     }
 }
 
+#[cfg(unix)]
 fn read_hostname() -> String {
     std::fs::read_to_string("/etc/hostname")
         .map(|s| s.trim().to_string())
         .unwrap_or_default()
+}
+
+#[cfg(windows)]
+fn read_hostname() -> String {
+    std::env::var("COMPUTERNAME").unwrap_or_default()
 }
 
 async fn enroll_http(

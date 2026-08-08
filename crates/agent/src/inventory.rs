@@ -1,82 +1,208 @@
-use std::collections::BTreeMap;
+#[cfg(not(windows))]
 use std::path::Path;
+use std::collections::BTreeMap;
 
 use airgap_proto::{DistroFamily, OsInventory, Package};
 
 fn hostname() -> String {
-    std::fs::read_to_string("/etc/hostname")
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|_| {
-            let out = std::process::Command::new("hostname")
-                .output()
-                .ok()
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
-            out.unwrap_or_else(|| "unknown".to_string())
-        })
-}
-
-fn kernel() -> String {
-    std::fs::read_to_string("/proc/sys/kernel/osrelease")
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|_| "unknown".to_string())
-}
-
-fn arch() -> String {
-    std::fs::read_to_string("/proc/sys/kernel/arch")
-        .map(|s| s.trim().to_string())
-        .ok()
-        .filter(|s| !s.is_empty() && s != "unknown")
-        .unwrap_or_else(|| {
-            std::process::Command::new("uname")
-                .arg("-m")
+    #[cfg(windows)]
+    {
+        std::env::var("COMPUTERNAME").unwrap_or_else(|_| {
+            std::process::Command::new("hostname")
                 .output()
                 .ok()
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                 .unwrap_or_else(|| "unknown".to_string())
         })
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::read_to_string("/etc/hostname")
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| {
+                let out = std::process::Command::new("hostname")
+                    .output()
+                    .ok()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+                out.unwrap_or_else(|| "unknown".to_string())
+            })
+    }
+}
+
+fn kernel() -> String {
+    #[cfg(windows)]
+    {
+        std::process::Command::new("cmd")
+            .args(["/c", "ver"])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| "unknown".to_string())
+    }
+}
+
+fn arch() -> String {
+    #[cfg(windows)]
+    {
+        std::env::var("PROCESSOR_ARCHITECTURE")
+            .unwrap_or_else(|_| "unknown".to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::read_to_string("/proc/sys/kernel/arch")
+            .map(|s| s.trim().to_string())
+            .ok()
+            .filter(|s| !s.is_empty() && s != "unknown")
+            .unwrap_or_else(|| {
+                std::process::Command::new("uname")
+                    .arg("-m")
+                    .output()
+                    .ok()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            })
+    }
 }
 
 fn bootloader() -> String {
-    if Path::new("/boot/grub2").exists() || Path::new("/boot/grub").exists() {
-        "grub2".to_string()
-    } else if Path::new("/boot/efi/EFI/systemd").exists()
-        || Path::new("/usr/lib/systemd/boot").exists()
+    #[cfg(windows)]
     {
-        "systemd-boot".to_string()
-    } else {
-        "unknown".to_string()
+        "windows".to_string()
+    }
+    #[cfg(not(windows))]
+    {
+        if Path::new("/boot/grub2").exists() || Path::new("/boot/grub").exists() {
+            "grub2".to_string()
+        } else if Path::new("/boot/efi/EFI/systemd").exists()
+            || Path::new("/usr/lib/systemd/boot").exists()
+        {
+            "systemd-boot".to_string()
+        } else {
+            "unknown".to_string()
+        }
     }
 }
 
 fn os_release() -> BTreeMap<String, String> {
-    let mut map = BTreeMap::new();
-    if let Ok(content) = std::fs::read_to_string("/etc/os-release") {
-        for line in content.lines() {
-            if let Some((k, v)) = line.split_once('=') {
-                let v = v.trim().trim_matches('"');
-                map.insert(k.trim().to_string(), v.to_string());
+    #[cfg(windows)]
+    {
+        let mut map = BTreeMap::new();
+        if let Ok(out) = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "(Get-CimInstance Win32_OperatingSystem) | Select-Object Caption,Version,BuildNumber | ConvertTo-Json",
+            ])
+            .output()
+        {
+            if let Ok(json) = String::from_utf8(out.stdout) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {
+                    if let Some(caption) = v.get("Caption").and_then(|x| x.as_str()) {
+                        map.insert("NAME".to_string(), caption.to_string());
+                    }
+                    if let Some(version) = v.get("Version").and_then(|x| x.as_str()) {
+                        map.insert("VERSION_ID".to_string(), version.to_string());
+                    }
+                    if let Some(build) = v.get("BuildNumber").and_then(|x| x.as_str()) {
+                        map.insert("BUILD_NUMBER".to_string(), build.to_string());
+                    }
+                }
             }
         }
+        map
     }
-    map
+    #[cfg(not(windows))]
+    {
+        let mut map = BTreeMap::new();
+        if let Ok(content) = std::fs::read_to_string("/etc/os-release") {
+            for line in content.lines() {
+                if let Some((k, v)) = line.split_once('=') {
+                    let v = v.trim().trim_matches('"');
+                    map.insert(k.trim().to_string(), v.to_string());
+                }
+            }
+        }
+        map
+    }
 }
 
 fn detect_family(os_name: &str) -> DistroFamily {
     let lower = os_name.to_lowercase();
-    if lower.contains("red hat") || lower.contains("rocky") || lower.contains("alma")
-        || lower.contains("fedora") || lower.contains("centos") || lower.contains("rhel")
+    if lower.contains("red hat")
+        || lower.contains("rocky")
+        || lower.contains("alma")
+        || lower.contains("fedora")
+        || lower.contains("centos")
+        || lower.contains("rhel")
     {
         DistroFamily::Rhel
     } else if lower.contains("debian") || lower.contains("ubuntu") {
         DistroFamily::Debian
-    } else if lower.contains("windows") {
+    } else if lower.contains("windows") || lower.contains("server 20") {
         DistroFamily::Windows
     } else {
         DistroFamily::Other
     }
 }
 
+fn collect_packages_windows() -> Vec<Package> {
+    let mut packages = Vec::new();
+    if let Ok(out) = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-HotFix | Select-Object HotFixID,InstalledOn,Description | ConvertTo-Json",
+        ])
+        .output()
+    {
+        if let Ok(json) = String::from_utf8(out.stdout) {
+            if let Ok(arr) = serde_json::from_str::<serde_json::Value>(&json) {
+                if let Some(arr) = arr.as_array() {
+                    for item in arr {
+                        let hotfix_id = item
+                            .get("HotFixID")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let installed_on = item
+                            .get("InstalledOn")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let description = item
+                            .get("Description")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if !hotfix_id.is_empty() {
+                            packages.push(Package {
+                                name: hotfix_id,
+                                version: installed_on,
+                                arch: std::env::var("PROCESSOR_ARCHITECTURE").unwrap_or_default(),
+                                source: description,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    packages
+}
+
 fn collect_packages(family: &DistroFamily) -> Vec<Package> {
+    #[cfg(windows)]
+    {
+        if matches!(family, DistroFamily::Windows) {
+            return collect_packages_windows();
+        }
+    }
     let (cmd, args) = match family {
         DistroFamily::Rhel => (
             "rpm",
@@ -109,6 +235,12 @@ fn collect_packages(family: &DistroFamily) -> Vec<Package> {
 }
 
 fn collect_repos(family: &DistroFamily) -> Vec<String> {
+    #[cfg(windows)]
+    {
+        if matches!(family, DistroFamily::Windows) {
+            return vec!["Microsoft Update".to_string(), "Windows Update".to_string()];
+        }
+    }
     let mut repos = Vec::new();
     match family {
         DistroFamily::Rhel => {
@@ -119,7 +251,8 @@ fn collect_repos(family: &DistroFamily) -> Vec<String> {
             if let Some(out) = out {
                 for line in String::from_utf8_lossy(&out.stdout).lines() {
                     if let Some(id) = line.split_whitespace().next() {
-                        if !id.starts_with("repo") && !id.starts_with("Updating")
+                        if !id.starts_with("repo")
+                            && !id.starts_with("Updating")
                             && !id.starts_with("Available")
                         {
                             repos.push(id.to_string());

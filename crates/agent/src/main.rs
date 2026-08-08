@@ -10,7 +10,10 @@ mod client;
 mod inventory;
 
 const DEFAULT_SERVER: &str = "https://172.16.5.20:8443";
+#[cfg(unix)]
 const DEFAULT_STATE_DIR: &str = "/var/lib/airgap-agent";
+#[cfg(windows)]
+const DEFAULT_STATE_DIR: &str = "C:\\ProgramData\\airgap-agent";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -26,6 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Package names come from the server's catalog (trusted) but are validated
 /// anyway before being interpolated into a shell command, to be safe.
+/// Windows KB format: KB1234567 or similar.
 fn is_safe_package(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 200
@@ -33,13 +37,12 @@ fn is_safe_package(name: &str) -> bool {
 }
 
 /// Applies a single approved update. For "package" updates the agent fetches
-/// the artifact (.rpm/.deb) from the server over mTLS, writes it to the
+/// the artifact (.rpm/.deb/.msu/.cab) from the server over mTLS, writes it to the
 /// state directory, then installs it from the local file so no direct
 /// internet access is needed:
-///   - RHEL:  dnf -y install --disablerepo=* <file.rpm>   (offline, resolves
-///            dependencies against the installed RPM database)
-///   - Debian: dpkg -i <file.deb>                          (offline; a missing
-///            dependency surfaces as a failed report with the dpkg output)
+///   - RHEL:    dnf -y install --disablerepo=* <file.rpm>
+///   - Debian:  dpkg -i <file.deb>
+///   - Windows: wusa.exe /quiet /norestart <file.msu> (or .cab via DISM)
 /// Returns (status code, detail): "ok" when the install succeeded, "failed"
 /// otherwise. Detail carries the resulting installed version or the tail of
 /// the package manager output.
@@ -60,6 +63,7 @@ async fn apply_update(
     let family = match inv.family {
         DistroFamily::Debian => "debian",
         DistroFamily::Rhel => "rhel",
+        DistroFamily::Windows => "windows",
         other => {
             return (
                 "failed".to_string(),
@@ -83,7 +87,14 @@ async fn apply_update(
     {
         artifact.filename.clone()
     } else {
-        format!("update-{}.{}", update.id, if family == "debian" { "deb" } else { "rpm" })
+        let ext = if family == "debian" {
+            "deb"
+        } else if family == "windows" {
+            "msu"
+        } else {
+            "rpm"
+        };
+        format!("update-{}.{}", update.id, ext)
     };
     let path = state_dir.join(filename);
     if let Err(e) = std::fs::write(&path, &artifact.bytes) {
@@ -92,6 +103,14 @@ async fn apply_update(
 
     let (cmd, args) = match inv.family {
         DistroFamily::Debian => ("dpkg", vec!["-i", path.to_str().unwrap_or_default()]),
+        DistroFamily::Windows => (
+            "wusa.exe",
+            vec![
+                path.to_str().unwrap_or_default(),
+                "/quiet",
+                "/norestart",
+            ],
+        ),
         _ => (
             "dnf",
             vec![
@@ -127,7 +146,15 @@ async fn apply_update(
         }
         Ok(out) => {
             let err = String::from_utf8_lossy(&out.stderr);
-            let tail: String = err.lines().rev().take(8).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(" | ");
+            let tail: String = err
+                .lines()
+                .rev()
+                .take(8)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join(" | ");
             ("failed".to_string(), tail)
         }
         Err(e) => ("failed".to_string(), e.to_string()),

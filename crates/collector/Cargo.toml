@@ -1,0 +1,22 @@
+[package]
+name = "airgap-collector"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+axum = { workspace = true }
+axum-server = { workspace = true }
+airgap-proto = { path = "../proto" }
+airgap-transport = { path = "../transport" }
+airgap-sandbox = { path = "../sandbox" }
+clap = { workspace = true }
+walkdir = "2"
+chrono = { workspace = true }
+uuid = { version = "1", features = ["serde", "v4"] }
+tracing-subscriber = { workspace = true }

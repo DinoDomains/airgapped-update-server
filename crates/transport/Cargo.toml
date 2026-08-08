@@ -1,0 +1,19 @@
+[package]
+name = "airgap-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+reqwest = { workspace = true }
+airgap-proto = { path = "../proto" }
+airgap-sandbox = { path = "../sandbox" }
+chrono = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.53"
