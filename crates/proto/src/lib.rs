@@ -108,3 +108,14 @@ pub struct ReportRequest {
 pub struct ReportResponse {
     pub accepted: bool,
 }
+
+/// Agent requests the actual package artifact (an .rpm/.deb) for an approved
+/// update. The server proxies it from the whitelisted upstream source over
+/// the mTLS channel so isolated agents never need direct internet access.
+/// `family` is the agent's distro family ("rhel" or "debian").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactRequest {
+    pub agent_id: String,
+    pub update_id: String,
+    pub family: String,
+}

@@ -1,0 +1,41 @@
+OpenCode session resume info
+============================
+Session ID : ses_03cc90d18ffeLFCKeM16P5rokv
+Title      : WSUS-like air-gapped update architecture
+Created    : 2026-08-02
+Updated    : 2026-08-02
+
+How to come back to this chat:
+  - In the opencode TUI, open the session list and pick
+    "WSUS-like air-gapped update architecture".
+  - CLI: opencode resume ses_03cc90d18ffeLFCKeM16P5rokv
+    (or: opencode --session ses_03cc90d18ffeLFCKeM16P5rokv)
+
+Project location:
+  /home/dino/Documents/projects/airgap-update-platform
+
+Status / context
+----------------
+Architecture designed for an air-gapped, WSUS-like secure update
+platform for a DevOps network. Requirements agreed:
+  - Update targets : both apps and OS (Linux-based, incl. containers)
+  - Topology       : fully air-gapped
+  - Scale          : small (<100 nodes)
+  - Conduit        : both sneakernet/USB and data diode (interchangeable)
+
+Design decisions:
+  - Two zones: Zone A (internet ingest + bundle builder) and Zone B
+    (air-gapped core server + clients), connected only by a one-way
+    conduit.
+  - Transfer bundle (catalog.json + artifacts/ + manifest.json +
+    manifest.sig) is the contract that makes the conduit swappable.
+  - Core server = WSUS analog: validator, approval service + admin UI,
+    internal repos (aptly / zot / MinIO), rings (dev->staging->prod),
+    immutable audit, RBAC.
+  - Client agent: small systemd unit; verifies signatures locally,
+    stages, applies, auto-rolls-back.
+
+Suggested next steps (unfinished):
+  1. Lock down the bundle schema as a spec (docs/bundle-schema.md).
+  2. Build PoC: Zone A builder -> USB -> verify/ingest on a VM.
+  3. Add agent + rings.

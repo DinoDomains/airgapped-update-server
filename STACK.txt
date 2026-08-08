@@ -1,0 +1,102 @@
+AIRGAP UPDATE PLATFORM - STACK & TOOLS
+=======================================
+For discussion with client. Last updated: M0 complete, M1 in progress.
+
+DEVELOPMENT STACK
+-----------------
+- Language: Rust (stable 1.97.1), edition 2021
+- Build: Cargo workspace with crates: proto, server, agent, ctl
+- Target: x86_64-unknown-linux-musl (fully static binaries, no glibc dependency)
+- Release profile: LTO (thin) + codegen-units 1
+- Repo mirrors (CN): rustup via RUSTUP_DIST_SERVER (tsinghua/tuna), crates.io
+  sparse index via ~/.cargo/config.toml
+
+SIGNIFICANT RUST CRATES
+-----------------------
+- tokio 1 (async runtime)
+- axum 0.7 + hyper 1 + hyper-util + tower (HTTP API, mTLS serving)
+- axum-server 0.7 (tls-rustls listener)
+- rustls 0.23 + tokio-rustls 0.26 (TLS 1.2/1.3), provider pinned to *ring*
+- rcgen 0.13 (internal CA, certificate issuance, x509-parser feature)
+- x509-parser 0.16 (peer cert CN extraction)
+- rustls-pemfile 2 (cert/key parsing)
+- reqwest 0.12 (upstream fetch, apt mirror sync)
+- serde / serde_json (all wire + storage formats)
+- thiserror, async-trait, tracing / tracing-subscriber
+- flate2 (Packages.gz parse/generate), sha2 + hex (artifact hashing),
+  tokio-util (file streaming)
+
+SERIALIZATION
+-------------
+- JSON for: agent wire protocol (API v1), server state store, catalog,
+  reports, tokens
+- Binary TLS: mTLS certs are standard PEM (X.509)
+
+LAB INFRASTRUCTURE
+------------------
+- VMware Workstation (host: this laptop)
+  - 3 VMs all running:
+    - srv        : Rocky Linux 8.10, 4 vCPU/4GB, gateway server
+                    ens160 NAT      = 172.16.237.133
+                    ens192 hostonly = 172.16.5.20
+    - agent-rocky: Rocky Linux 8.10      hostonly 172.16.5.21
+    - agent-ubu  : Ubuntu 24.04.4 LTS    hostonly 172.16.5.22
+- Networking: VMware vmnet8 (NAT 172.16.237.0/24), vmnet1
+  (host-only 172.16.5.0/24). Agents have NO default route / no internet
+  egress - they can only reach the server. Server is the ONLY online host.
+- Remote admin: SSH key pair ~/.ssh/airgap_lab (ed25519), root on Rocky,
+  ubuntu+NOPASSWD sudo on Ubuntu
+- VM clone-from-clean-master workflow, guestOS id ubuntu-64
+
+SECURITY COMPONENTS
+-------------------
+- Internal CA (rcgen), persisted under server store /ca/
+- Server cert SANs: airgap-server.internal, 172.16.5.20, 172.16.237.133, 127.0.0.1
+- Client certs: CN = agent_id, EKU = ClientAuth
+- Mutual TLS: server requires client cert (WebPkiClientVerifier);
+  per-route auth enforces cert CN == agent_id
+- One-time enrollment token (default airgap-bootstrap), seed via
+  AIRGAP_ENROLL_TOKEN env var
+- Enroll flow: agent posts token -> receives client cert + CA
+- Client key stored 0600 on agent
+
+SERVER ON-PREM (srv, Rocky 8)
+-----------------------------
+- airgap-server binary at /usr/local/bin
+- State dir: /var/lib/airgap-server (agents.json, reports.json, catalog.json,
+  tokens.json, ca/)
+- Listen: 0.0.0.0:8443 (API, mTLS)
+- M1: HTTP repo serving planned on port 8080 (mirror + ring channels)
+- firewalld: 8443/tcp allowed + rich rule for 172.16.5.0/24
+- SELinux set to Permissive (M0 only, revisit for prod hardening)
+- Repo tooling: yum/dnf (RHEL-family package manager; yum is the legacy
+  front-end, dnf is the modern default on Rocky 8) + dnf-plugins-core
+  (reposync), apt/apt-get + dpkg (Debian-family package manager on
+  agent-ubu), rpm/rpm2cpio, createrepo_c (to install),
+  NO debmirror/apt-mirror on Rocky
+
+PACKAGE REPO MIRRORING PLAN (M1)
+--------------------------------
+- yum/dnf (Rocky): dnf reposync from upstream (IPv4 mirrors -
+  dl.rockylinux.org, because mirror.rockylinux.org is IPv6-only/unreliable
+  in this NAT)
+- apt/apt-get (Ubuntu): custom Rust sync engine (fetch dists/noble
+  Packages.gz, parse metadata, fetch .deb on approval) - no debmirror needed
+- Ring channels: /channels/{dev,staging,prod}/{dnf,apt} with regenerated
+  metadata (createrepo_c for dnf, own Packages+Release gen for apt)
+- Agents repointed to http://<srv>:8080/channels/<ring>/... via dnf repo
+  file / apt sources.list.d
+
+OPS / TOOLING NOTES
+-------------------
+- No python3 on srv (JSON inspected via grep/sed/awk)
+- Mirror list fallback for rocky downloads; tuna mirrors for rust toolchain
+- systemd-inhibit used to keep host awake during long builds/tests
+- LAB.md documents rebuild/redeploy/run commands
+
+RINGS / DEPLOYMENT MODEL
+------------------------
+- dev -> staging -> prod approval gating (per-package approval in M1)
+- Agents poll server /updates, receive UpdateItems filtered by ring
+- Agents install from ring channel, report status + before/after versions
+- Postgres + dashboard deferred to later milestones (M6)

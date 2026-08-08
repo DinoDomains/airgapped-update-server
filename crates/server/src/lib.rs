@@ -4,6 +4,7 @@ pub mod auth;
 pub mod ca;
 pub mod catalog;
 pub mod http;
+pub mod provision;
 pub mod store;
 pub mod tls;
 
@@ -12,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::extract::DefaultBodyLimit;
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::Router;
 use tokio::sync::Mutex;
 use tokio_rustls::TlsAcceptor;
@@ -38,6 +39,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let store_dir = PathBuf::from(
         std::env::var("AIRGAP_STORE_DIR").unwrap_or_else(|_| DEFAULT_STORE_DIR.to_string()),
     );
+    let server_url = std::env::var("AIRGAP_SERVER_URL")
+        .unwrap_or_else(|_| "https://172.16.5.20:8443".to_string());
     let cert_dir = store_dir.join("certs");
 
     let ca = Arc::new(Mutex::new(ca::Ca::load_or_create(&store_dir.join("ca"))?));
@@ -50,6 +53,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         store: store.clone(),
         ca: ca.clone(),
         cert_dir: cert_dir.clone(),
+        store_dir: store_dir.clone(),
         catalog: catalog.clone(),
         audit: audit.clone(),
         rate: api::RateLimiter::default(),
@@ -61,6 +65,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .route("/inventory", post(api::inventory))
         .route("/updates", post(api::poll))
         .route("/report", post(api::report))
+        .route("/artifact", post(api::artifact))
         .route("/health", get(api::health))
         .with_state(api_state)
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024));
@@ -74,6 +79,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         catalog: catalog.clone(),
         audit: audit.clone(),
         auth: auth.clone(),
+        store_dir: store_dir.clone(),
+        server_url,
+        scan: Arc::new(tokio::sync::RwLock::new(None)),
     };
     let http_app = Router::new()
         .route("/", get(http::dashboard))
@@ -108,7 +116,21 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/sources", post(http::add_source))
         .route("/api/sources/:name", post(http::toggle_source))
         .route("/api/sources/:name", delete(http::delete_source))
-        .with_state(http_state);
+        .route("/api/credentials", get(http::list_credentials))
+        .route("/api/credentials", post(http::upsert_credential))
+        .route("/api/credentials/:name", delete(http::delete_credential))
+        .route("/api/networks", get(http::list_networks))
+        .route("/api/networks", post(http::add_network))
+        .route("/api/networks/:name", delete(http::delete_network))
+        .route("/api/networks/:name/scan", post(http::scan_network))
+        .route("/api/provision", get(http::provision_status))
+        .route("/api/provision/:ip", post(http::provision_host))
+        .route(
+            "/api/provision/agent-binary",
+            put(http::upload_agent_binary),
+        )
+        .with_state(http_state)
+        .layer(DefaultBodyLimit::max(64 * 1024 * 1024));
     let http_task = http::serve(http_listen, http_app);
 
     tokio::try_join!(api_task, http_task)?;

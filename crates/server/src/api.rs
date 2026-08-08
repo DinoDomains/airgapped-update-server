@@ -2,18 +2,19 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use airgap_proto::{
-    EnrollRequest, EnrollResponse, InventoryRequest, InventoryResponse, OsInventory, PollRequest,
-    PollResponse, RegisterRequest, RegisterResponse, ReportRequest, ReportResponse,
+    ArtifactRequest, EnrollRequest, EnrollResponse, InventoryRequest, InventoryResponse,
+    OsInventory, PollRequest, PollResponse, RegisterRequest, RegisterResponse, ReportRequest,
+    ReportResponse,
 };
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use tokio::sync::Mutex;
 
 use crate::audit::AuditLog;
 use crate::ca::Ca;
-use crate::catalog::Catalog;
+use crate::catalog::{self, Catalog};
 use crate::store::{AgentRecord, ReportRecord, Store};
 use crate::tls::ClientIdentity;
 
@@ -22,6 +23,7 @@ pub struct ApiState {
     pub store: Arc<Store>,
     pub ca: Arc<Mutex<Ca>>,
     pub cert_dir: std::path::PathBuf,
+    pub store_dir: std::path::PathBuf,
     pub catalog: Arc<Catalog>,
     pub audit: Arc<AuditLog>,
     pub rate: RateLimiter,
@@ -49,8 +51,8 @@ impl RateLimiter {
     }
 }
 
-fn err(status: StatusCode, msg: &str) -> Response {
-    (status, Json(serde_json::json!({ "error": msg }))).into_response()
+fn err<S: Into<String>>(status: StatusCode, msg: S) -> Response {
+    (status, Json(serde_json::json!({ "error": msg.into() }))).into_response()
 }
 
 fn require_auth(identity: &ClientIdentity) -> Result<String, Response> {
@@ -185,7 +187,7 @@ pub async fn poll(
     if cn != req.agent_id {
         return err(StatusCode::FORBIDDEN, "agent_id does not match certificate");
     }
-    let updates = st.store.pending_updates().await;
+    let updates = st.store.pending_updates_for_agent(&cn).await;
     let scan_requested = st.store.scan_pending(&cn).await;
     Json(PollResponse {
         updates,
@@ -229,15 +231,154 @@ pub async fn report(
     if cn != req.agent_id {
         return err(StatusCode::FORBIDDEN, "agent_id does not match certificate");
     }
+    let req_id = req.update_id.clone();
+    let code = req.status.code.clone();
     st.store
         .record_report(ReportRecord {
             agent_id: req.agent_id,
-            update_id: req.update_id,
+            update_id: req_id.clone(),
             status: req.status,
             ts: now_ts(),
         })
         .await;
+    let next_status = if code == "ok" { "done" } else { "failed" };
+    st.store.mark_update_status(&req_id, next_status).await;
+    st.audit.log(&cn, "update_result", &req_id, next_status);
     Json(ReportResponse { accepted: true }).into_response()
+}
+
+const MAX_ARTIFACT_BYTES: usize = 256 * 1024 * 1024;
+
+/// Serves the actual .rpm/.deb for an approved-pending update by proxying it
+/// from the whitelisted upstream source. The server is the only online host;
+/// agents on isolated networks fetch the artifact over mTLS and install from
+/// the local file. Only approved updates are served, and only to their
+/// target agent. Fetched artifacts are cached on disk by update id.
+pub async fn artifact(
+    State(st): State<ApiState>,
+    identity: ClientIdentity,
+    Json(req): Json<ArtifactRequest>,
+) -> Response {
+    let cn = match require_auth(&identity) {
+        Ok(cn) => cn,
+        Err(r) => return r,
+    };
+    if cn != req.agent_id {
+        return err(
+            StatusCode::FORBIDDEN,
+            "agent_id does not match client certificate",
+        );
+    }
+    if !st.rate.check(&format!("artifact:{cn}"), 240, 60).await {
+        return err(StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded");
+    }
+    let family = req.family.to_lowercase();
+    if family != "rhel" && family != "debian" {
+        return err(StatusCode::BAD_REQUEST, "unsupported family");
+    }
+    let Some(update) = st.store.update_request(&req.update_id).await else {
+        return err(StatusCode::NOT_FOUND, "update not found");
+    };
+    if update.agent_id != req.agent_id {
+        return err(
+            StatusCode::FORBIDDEN,
+            "update does not belong to this agent",
+        );
+    }
+    if update.status != "approved-pending" {
+        return err(
+            StatusCode::FORBIDDEN,
+            "update is not approved for install",
+        );
+    }
+
+    let artifact_dir = st.store_dir.join("artifacts");
+    let cached = artifact_dir.join(&req.update_id);
+    if let Ok(bytes) = tokio::fs::read(&cached).await {
+        if !bytes.is_empty() {
+            return artifact_response(&artifact_filename(&update.package, &family), &bytes);
+        }
+    }
+
+    let sources = st.store.enabled_sources().await;
+    let Some(url) = st
+        .catalog
+        .artifact_url(&family, &update.package, &sources)
+        .await
+    else {
+        return err(
+            StatusCode::NOT_FOUND,
+            format!(
+                "no artifact location known for {}; refresh the catalog",
+                update.package
+            ),
+        );
+    };
+
+    let client = catalog::build_client(&sources);
+    let resp = match client.get(&url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return err(
+                StatusCode::BAD_GATEWAY,
+                format!("upstream fetch failed: {e}"),
+            )
+        }
+    };
+    let status = resp.status();
+    if !status.is_success() {
+        return err(
+            StatusCode::BAD_GATEWAY,
+            format!("upstream fetch failed: HTTP {status}"),
+        );
+    }
+    if let Some(len) = resp.content_length() {
+        if len > MAX_ARTIFACT_BYTES as u64 {
+            return err(StatusCode::BAD_GATEWAY, "artifact too large");
+        }
+    }
+    let bytes = match resp.bytes().await {
+        Ok(b) => b.to_vec(),
+        Err(e) => {
+            return err(
+                StatusCode::BAD_GATEWAY,
+                format!("artifact read failed: {e}"),
+            )
+        }
+    };
+    if bytes.is_empty() || bytes.len() > MAX_ARTIFACT_BYTES {
+        return err(StatusCode::BAD_GATEWAY, "artifact is empty or too large");
+    }
+
+    let _ = tokio::fs::create_dir_all(&artifact_dir).await;
+    let _ = tokio::fs::write(&cached, &bytes).await;
+    st.audit.log(&cn, "artifact", &update.package, &url);
+    artifact_response(&artifact_filename(&update.package, &family), &bytes)
+}
+
+fn artifact_filename(pkg: &str, family: &str) -> String {
+    let base = if pkg.chars().all(|c| c.is_ascii_alphanumeric() || "+._-".contains(c)) {
+        pkg
+    } else {
+        "package"
+    };
+    let ext = if family == "debian" { "deb" } else { "rpm" };
+    format!("{base}.{ext}")
+}
+
+fn artifact_response(filename: &str, bytes: &[u8]) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CONTENT_LENGTH, bytes.len().to_string())
+        .header("x-artifact-filename", filename)
+        .body(axum::body::Body::from(bytes.to_vec()))
+        .unwrap_or_else(|_| {
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to build artifact response",
+            )
+        })
 }
 
 fn now_ts() -> String {

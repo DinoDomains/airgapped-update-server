@@ -1,0 +1,77 @@
+AIRGAP UPDATE PLATFORM - PROGRESS LOG
+======================================
+Last updated: M0 complete & deployed, M1 (mirroring + ring gating) in progress
+
+MILESTONE 0 - PROJECT SKELETON (COMPLETE)
+-----------------------------------------
+Goal: standing skeleton - agents enroll, register, report inventory to
+server over mTLS, poll for updates.
+
+Code built:
+- Cargo workspace: crates/proto, crates/server, crates/agent
+- proto: wire types + API_VERSION=1 (Enroll/Register/Inventory/Poll/Report)
+- server: internal CA, JSON store, mTLS endpoint on :8443, routes
+  /enroll /register /inventory /updates /report /health
+- agent: OS/package inventory, token enrollment, cert reuse, poll loop
+
+Local verification (host, 127.0.0.1:8443):
+- Full enroll -> register -> inventory -> poll round trip OK
+- Server restart + CA reload from persisted key OK
+- Agent cert reuse on second run OK
+- Fix: rustls provider conflict (aws-lc-rs vs ring) -> pinned ring,
+  static musl build OK
+
+Lab deployment (3 VMs, VMware Workstation):
+- srv (Rocky 8.10): airgap-server running from /var/lib/airgap-server,
+  firewalld 8443/tcp + host-only subnet allow, SELinux Permissive
+- agent-rocky: enrolled "agent-agent-rocky" (Rocky 8.10, x86_64) - fixed
+  arch detection (uname -m fallback)
+- agent-ubu: enrolled "agent-agent-ubu" (Ubuntu 24.04.4 LTS, x86_64,
+  dpkg package list) - fixed state-dir permissions (chown ubuntu)
+- Both agents report inventory; verified in server agents.json
+- LAB.md updated with M0 status + rebuild/redeploy/run commands
+
+MILESTONE 1 - MIRRORS + RING APPROVAL (IN PROGRESS)
+---------------------------------------------------
+Goal: server pulls approved packages from upstream, serves native yum/dnf
+and apt repos, gated by approval rings dev -> staging -> prod.
+
+Done:
+- Decided repo architecture: server = only online host; agents repointed
+  to server HTTP repo (port 8080), server syncs upstream
+- Tooling check on srv: dnf-plugins-core present (reposync available),
+  createrepo_c NOT installed yet, no debmirror/apt-mirror (planned Rust
+  apt sync engine instead), no python3 on srv
+- Restructured server crate into lib + bin so an admin CLI (ctl) can
+  share the same code
+- Added deps: flate2 (Packages.gz), sha2 + hex (artifact hashing),
+  tokio-util (file streaming)
+
+Next steps:
+- Implement server HTTP repo file serving (mirror + channels) on :8080
+- Implement sync: dnf reposync + Rust apt mirror (metadata + fetch .deb)
+- Implement approval rings + channel metadata regen (createrepo_c for
+  dnf, own Packages/Release gen for apt)
+- Implement ctl CLI: sync-dnf, sync-apt, catalog, approve, channel, publish
+- Implement agent update apply: dnf update / apt upgrade from ring channel,
+  report before/after versions
+- Repoint agents at http://172.16.5.20:8080/channels/<ring>/...
+- End-to-end test: approve package -> agent installs -> report verified
+
+MILESTONES AHEAD (NOT STARTED)
+------------------------------
+- M2: source policy engine (allowlist/blacklist, default-deny)
+- M3: update bundles + git-managed update metadata
+- M4: VM sandbox test host (boot/health/smoke gate before release)
+- M5: kernel + bootloader handling (alternate boot entry)
+- M6: dashboard (approval UI, history, reporting)
+- M7: Windows agent
+
+KNOWN QUIRKS / LESSONS
+----------------------
+- Run server always with AIRGAP_STORE_DIR set; otherwise a fresh CA is
+  created in ./data and existing agents fail with BadSignature
+- mirror.rockylinux.org is IPv6-only/unreliable under NAT - use IPv4
+  mirrors (dl.rockylinux.org)
+- Use pkill -x (not pkill -f) to avoid killing the invoking shell
+- Rocky agents lack /proc/sys/kernel/arch - uname -m fallback needed

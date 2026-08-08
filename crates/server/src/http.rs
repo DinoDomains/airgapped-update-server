@@ -1,18 +1,22 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use airgap_proto::OsInventory;
+use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
+use tokio::sync::RwLock;
 
 use crate::audit::AuditLog;
 use crate::auth::{Auth, Session};
 use crate::catalog::{Catalog, LatestPackage};
-use crate::store::{AgentRecord, Policy, Source, Store, UpdateRequest};
+use crate::provision::ScanJob;
+use crate::store::{AgentRecord, Credential, Network, Policy, Source, Store, UpdateRequest};
 
 #[derive(Clone)]
 pub struct HttpState {
@@ -20,6 +24,9 @@ pub struct HttpState {
     pub catalog: Arc<Catalog>,
     pub audit: Arc<AuditLog>,
     pub auth: Arc<Auth>,
+    pub store_dir: PathBuf,
+    pub server_url: String,
+    pub scan: Arc<RwLock<Option<ScanJob>>>,
 }
 
 pub async fn serve(
@@ -680,6 +687,312 @@ pub struct UpdateBody {
     pub package: String,
 }
 
+pub async fn list_credentials(State(st): State<HttpState>, headers: HeaderMap) -> Response {
+    let _session = match require_role(&st, &headers, crate::auth::ROLE_ADMIN).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    Json(st.store.list_credentials().await).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct CredentialBody {
+    pub name: String,
+    pub username: String,
+    pub password: String,
+    pub port: Option<u16>,
+    pub domain: Option<String>,
+    pub note: Option<String>,
+}
+
+pub async fn upsert_credential(
+    State(st): State<HttpState>,
+    headers: HeaderMap,
+    Json(b): Json<CredentialBody>,
+) -> Response {
+    let session = match require_role(&st, &headers, crate::auth::ROLE_ADMIN).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let name = sanitize_str(&b.name, 100);
+    if name.is_empty()
+        || !name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.@".contains(c))
+    {
+        return err(StatusCode::BAD_REQUEST, "name must use letters, digits, -_.@");
+    }
+    if b.username.trim().is_empty() {
+        return err(StatusCode::BAD_REQUEST, "username is required");
+    }
+    if b.password.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "password is required");
+    }
+    let credential = Credential {
+        name,
+        username: sanitize_str(b.username.trim(), 100),
+        password: b.password,
+        port: b.port.unwrap_or(22).clamp(1, 65535),
+        domain: sanitize_str(b.domain.as_deref().unwrap_or(""), 100),
+        note: sanitize_str(b.note.as_deref().unwrap_or(""), 200),
+    };
+    st.store.upsert_credential(credential).await;
+    st.audit
+        .log(&session.operator, "credential_save", &b.name, "ok");
+    Json(serde_json::json!({ "ok": true })).into_response()
+}
+
+pub async fn delete_credential(
+    State(st): State<HttpState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let session = match require_role(&st, &headers, crate::auth::ROLE_ADMIN).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match st.store.delete_credential(&name).await {
+        true => {
+            st.audit.log(&session.operator, "credential_delete", &name, "ok");
+            Json(serde_json::json!({ "ok": true })).into_response()
+        }
+        false => err(StatusCode::NOT_FOUND, "credential not found"),
+    }
+}
+
+pub async fn list_networks(State(st): State<HttpState>, headers: HeaderMap) -> Response {
+    let _session = match require_role(&st, &headers, crate::auth::ROLE_ADMIN).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    Json(st.store.list_networks().await).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct NetworkBody {
+    pub name: String,
+    pub cidr: String,
+}
+
+pub async fn add_network(
+    State(st): State<HttpState>,
+    headers: HeaderMap,
+    Json(b): Json<NetworkBody>,
+) -> Response {
+    let session = match require_role(&st, &headers, crate::auth::ROLE_ADMIN).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let name = sanitize_str(&b.name, 100);
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.@".contains(c)) {
+        return err(StatusCode::BAD_REQUEST, "name must use letters, digits, -_.@");
+    }
+    let cidr = sanitize_str(&b.cidr, 64);
+    if let Err(e) = crate::provision::parse_cidr(&cidr) {
+        return err(StatusCode::BAD_REQUEST, &e);
+    }
+    let network = Network {
+        name,
+        cidr,
+        last_scanned: String::new(),
+    };
+    st.store.upsert_network(network).await;
+    st.audit.log(&session.operator, "network_add", &b.cidr, "ok");
+    Json(serde_json::json!({ "ok": true })).into_response()
+}
+
+pub async fn delete_network(
+    State(st): State<HttpState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let session = match require_role(&st, &headers, crate::auth::ROLE_ADMIN).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match st.store.delete_network(&name).await {
+        true => {
+            st.audit.log(&session.operator, "network_delete", &name, "ok");
+            Json(serde_json::json!({ "ok": true })).into_response()
+        }
+        false => err(StatusCode::NOT_FOUND, "network not found"),
+    }
+}
+
+pub async fn scan_network(
+    State(st): State<HttpState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let session = match require_role(&st, &headers, crate::auth::ROLE_ADMIN).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let network = match st
+        .store
+        .list_networks()
+        .await
+        .into_iter()
+        .find(|n| n.name == name)
+    {
+        Some(n) => n,
+        None => return err(StatusCode::NOT_FOUND, "network not found"),
+    };
+    {
+        let scan = st.scan.read().await;
+        if let Some(job) = scan.as_ref() {
+            if job.running {
+                return err(StatusCode::CONFLICT, "a discovery scan is already running");
+            }
+        }
+    }
+    let started = now_ts();
+    *st.scan.write().await = Some(ScanJob {
+        network: network.cidr.clone(),
+        started: started.clone(),
+        running: true,
+        hosts: vec![],
+        error: String::new(),
+    });
+    st.audit
+        .log(&session.operator, "provision_scan", &network.cidr, "started");
+    let scan_state = st.scan.clone();
+    let store = st.store.clone();
+    let audit = st.audit.clone();
+    let net_name = network.name.clone();
+    let net_cidr = network.cidr.clone();
+    tokio::spawn(async move {
+        let result = crate::provision::scan_network(&net_cidr).await;
+        let mut job = scan_state.write().await;
+        if let Some(j) = job.as_mut() {
+            match result {
+                Ok(fresh) => {
+                    let old = store.list_discovery().await;
+                    let merged = crate::provision::merge_discovery(&old, fresh);
+                    store.save_discovery(merged.clone()).await;
+                    store.set_network_scanned(&net_name, &started).await;
+                    j.hosts = merged;
+                    j.running = false;
+                    j.error = String::new();
+                    audit.log(
+                        "system",
+                        "provision_scan",
+                        &net_cidr,
+                        &format!("ok:{} hosts", j.hosts.len()),
+                    );
+                }
+                Err(e) => {
+                    j.running = false;
+                    j.error = e;
+                    audit.log("system", "provision_scan", &net_cidr, "failed");
+                }
+            }
+        }
+    });
+    Json(serde_json::json!({ "ok": true, "network": network.cidr })).into_response()
+}
+
+pub async fn provision_status(State(st): State<HttpState>, headers: HeaderMap) -> Response {
+    let _session = match require_role(&st, &headers, crate::auth::ROLE_ADMIN).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let networks = st.store.list_networks().await;
+    let hosts = st.store.list_discovery().await;
+    let credentials = st.store.list_credentials().await;
+    let scan = st.scan.read().await.clone();
+    let binary = st.store.agent_binary_present().await;
+    Json(serde_json::json!({
+        "networks": networks,
+        "hosts": hosts,
+        "credentials": credentials,
+        "scan": scan,
+        "agent_binary": binary.map(|size| serde_json::json!({ "present": true, "size": size }))
+            .unwrap_or_else(|| serde_json::json!({ "present": false, "size": 0 })),
+        "server_url": st.server_url,
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+pub struct ProvisionBody {
+    pub credential: String,
+}
+
+pub async fn provision_host(
+    State(st): State<HttpState>,
+    Path(ip): Path<String>,
+    headers: HeaderMap,
+    Json(b): Json<ProvisionBody>,
+) -> Response {
+    let session = match require_role(&st, &headers, crate::auth::ROLE_ADMIN).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let credential = match st.store.get_credential(&b.credential).await {
+        Some(c) => c,
+        None => return err(StatusCode::NOT_FOUND, "credential not found"),
+    };
+    match crate::provision::provision_host(
+        &st.store,
+        &st.store_dir,
+        &st.server_url,
+        &ip,
+        &credential,
+    )
+    .await
+    {
+        Ok(outcome) => {
+            st.store
+                .mark_discovery_provisioned(
+                    &ip,
+                    &outcome.hostname,
+                    &outcome.agent_id,
+                    if outcome.ok { "" } else { &outcome.detail },
+                )
+                .await;
+            st.audit.log(
+                &session.operator,
+                "provision_push",
+                &format!("{ip}->{}", outcome.agent_id),
+                if outcome.ok { "ok" } else { "partial" },
+            );
+            Json(serde_json::json!({
+                "ok": outcome.ok,
+                "agent_id": outcome.agent_id,
+                "hostname": outcome.hostname,
+                "detail": outcome.detail,
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            st.store.mark_discovery_provisioned(&ip, "", "", &e).await;
+            st.audit.log(&session.operator, "provision_push", &ip, "failed");
+            err(StatusCode::BAD_GATEWAY, &e)
+        }
+    }
+}
+
+pub async fn upload_agent_binary(
+    State(st): State<HttpState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let session = match require_role(&st, &headers, crate::auth::ROLE_ADMIN).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    if body.len() < 100_000 || body.len() > 64 * 1024 * 1024 {
+        return err(StatusCode::BAD_REQUEST, "agent binary must be 100KB..64MB");
+    }
+    match st.store.write_agent_binary(&body).await {
+        Ok(()) => {
+            st.audit
+                .log(&session.operator, "agent_binary_upload", "provision", &format!("{}", body.len()));
+            Json(serde_json::json!({ "ok": true, "size": body.len() })).into_response()
+        }
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
 pub async fn request_update(
     State(st): State<HttpState>,
     headers: HeaderMap,
@@ -883,6 +1196,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       <button data-view="audit" onclick="showView('audit')">Audit log<small>who did what</small></button>
       <button data-view="policy" id="navPolicy" style="display:none" onclick="showView('policy')">Policy<small>allowlist / default-deny (admin)</small></button>
       <button data-view="sources" id="navSources" style="display:none" onclick="showView('sources')">Sources<small>whitelisted upstreams (admin)</small></button>
+      <button data-view="provision" id="navProvision" style="display:none" onclick="showView('provision')">Provision<small>discover &amp; push agents (admin)</small></button>
       <button data-view="operators" id="navOperators" style="display:none" onclick="showView('operators')">Operators<small>accounts &amp; roles (admin)</small></button>
     </nav>
 
@@ -1028,6 +1342,57 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
         <p class="muted" style="margin:8px 0 0;font-size:11px">apt sources need the base URL + suite (components main/universe, arch amd64). dnf sources need the base URL of the repo dir. "none" lets you whitelist a future source (e.g. a Windows/WSUS mirror) without syncing it yet.</p>
       </div>
     </div>
+
+    <div class="view" id="viewProvision">
+      <div class="headline"><h2>Provision</h2><span class="muted">discover devices on a network, then push the agent to them over SSH</span></div>
+      <div class="card" style="margin-top:8px;cursor:default">
+        <h3 style="margin:0 0 10px;font-size:14px">Networks</h3>
+        <div class="toolbar" style="margin:0">
+          <input id="netName" placeholder="name, e.g. lab">
+          <input id="netCidr" placeholder="CIDR, e.g. 172.16.5.0/24">
+          <button onclick="addNetwork()">Add network</button>
+        </div>
+        <table style="margin-top:8px">
+          <thead><tr><th>Name</th><th>CIDR</th><th>Last scanned</th><th></th></tr></thead>
+          <tbody id="netBody"></tbody>
+        </table>
+      </div>
+      <div class="card" style="margin-top:12px;cursor:default">
+        <h3 style="margin:0 0 10px;font-size:14px">Agent binary</h3>
+        <div class="toolbar" style="margin:0">
+          <input type="file" id="agentBin">
+          <button onclick="uploadBinary()">Upload agent binary</button>
+          <span class="muted" id="binState"></span>
+        </div>
+        <p class="muted" style="margin:8px 0 0;font-size:11px">This is the airgap-agent binary that gets installed on discovered Linux devices. Build it with <b>cargo build --release --target x86_64-unknown-linux-musl</b>.</p>
+      </div>
+      <div class="headline" style="margin-top:16px"><h2>Discovered hosts</h2><span class="muted" id="hostCount"></span></div>
+      <div class="toolbar">
+        <button class="ghost" onclick="loadProvision()">Refresh</button>
+        <span class="mut" id="scanState"></span>
+      </div>
+      <div class="empty" id="hostEmpty" style="display:none">Nothing discovered yet. Add a network above and scan it.</div>
+      <table style="margin-top:12px">
+        <thead><tr><th>IP</th><th>Ports</th><th>Family</th><th>Hostname</th><th>Status</th><th></th></tr></thead>
+        <tbody id="hostBody"></tbody>
+      </table>
+      <div class="card" style="margin-top:16px;cursor:default">
+        <h3 style="margin:0 0 10px;font-size:14px">SSH credentials</h3>
+        <div class="toolbar" style="margin:0;flex-wrap:wrap">
+          <input id="credName" placeholder="name">
+          <input id="credUser" placeholder="username">
+          <input id="credPass" type="password" placeholder="password">
+          <input id="credPort" placeholder="port (22)" style="width:90px">
+          <input id="credDomain" placeholder="domain (optional, future AD)">
+          <button onclick="addCredential()">Save credential</button>
+        </div>
+        <table style="margin-top:8px">
+          <thead><tr><th>Name</th><th>User</th><th>Port</th><th>Domain</th><th></th></tr></thead>
+          <tbody id="credBody"></tbody>
+        </table>
+        <p class="muted" style="margin:8px 0 0;font-size:11px">Passwords live in credentials.json on the server and are never sent back to the browser. Windows hosts (ports 445/5985/3389) are listed but can't be provisioned yet &mdash; a Windows agent is a separate milestone.</p>
+      </div>
+    </div>
   </div>
 </main>
 </div>
@@ -1132,6 +1497,7 @@ function enterApp(op, r){
   $('#navOperators').style.display = r === 'admin' ? 'block' : 'none';
   $('#navPolicy').style.display = r === 'admin' ? 'block' : 'none';
   $('#navSources').style.display = r === 'admin' ? 'block' : 'none';
+  $('#navProvision').style.display = r === 'admin' ? 'block' : 'none';
   $('#user').value=''; $('#pass').value='';
 }
 
@@ -1154,6 +1520,7 @@ function showView(v){
   if(v==='operators'){ loadOperators(); }
   if(v==='policy'){ loadPolicy(); }
   if(v==='sources'){ loadSources(); }
+  if(v==='provision'){ loadProvision(); }
 }
 
 async function boot(){
@@ -1570,6 +1937,175 @@ async function delSource(name){
     await api('/api/sources/'+encodeURIComponent(name), {method:'DELETE'});
     toast('Source '+name+' deleted', 'ok');
     loadSources();
+  }catch(e){ toast('Delete failed: '+e.message, 'err'); }
+}
+
+let provData = null, provTimer = null;
+
+function byId(id){ return document.getElementById(id); }
+
+async function loadProvision(){
+  try{
+    provData = await api('/api/provision');
+    renderProvNetworks();
+    renderProvHosts();
+    renderProvCreds();
+    renderProvBin();
+    renderProvScan();
+  }catch(e){ toast('Failed to load provision: '+e.message, 'err'); }
+}
+
+function renderProvScan(){
+  const s = provData && provData.scan;
+  if(!s){ $('#scanState').textContent = ''; return; }
+  if(s.running) $('#scanState').innerHTML = 'scanning '+esc(s.network)+'&hellip;';
+  else if(s.error) $('#scanState').innerHTML = '<span class="upd">last scan failed: '+esc(s.error)+'</span>';
+  else $('#scanState').innerHTML = 'last scan of '+esc(s.network)+' ('+s.hosts.length+' hosts) '+rel(s.started);
+}
+
+function renderProvNetworks(){
+  const nets = (provData&&provData.networks)||[];
+  $('#netBody').innerHTML = nets.map(n=>`
+    <tr>
+      <td><b>${esc(n.name)}</b></td>
+      <td>${esc(n.cidr)}</td>
+      <td class="mut">${rel(n.last_scanned)}</td>
+      <td style="white-space:nowrap">
+        <button class="ghost" onclick="scanNetwork('${esc(n.name)}')">Scan now</button>
+        <button class="ghost" onclick="delNetwork('${esc(n.name)}')">Delete</button>
+      </td>
+    </tr>`).join('') || '<tr><td colspan="4" class="mut">no networks yet</td></tr>';
+}
+
+async function addNetwork(){
+  const name = $('#netName').value.trim(), cidr = $('#netCidr').value.trim();
+  if(!name || !cidr){ toast('Name and CIDR are required', 'err'); return; }
+  try{
+    await api('/api/networks', {method:'POST', body: JSON.stringify({name, cidr})});
+    toast('Network '+name+' added', 'ok');
+    $('#netName').value=''; $('#netCidr').value='';
+    loadProvision();
+  }catch(e){ toast('Add failed: '+e.message, 'err'); }
+}
+
+async function scanNetwork(name){
+  try{
+    await api('/api/networks/'+encodeURIComponent(name)+'/scan', {method:'POST'});
+    toast('Scanning '+name+' in the background&hellip;', 'ok');
+    loadProvision();
+    if(provTimer) clearInterval(provTimer);
+    provTimer = setInterval(()=>{
+      loadProvision();
+      if(provData && provData.scan && !provData.scan.running){ clearInterval(provTimer); provTimer=null; }
+    }, 2000);
+  }catch(e){ toast('Scan failed: '+e.message, 'err'); }
+}
+
+async function delNetwork(name){
+  if(!confirm('Delete network '+name+'?')) return;
+  try{
+    await api('/api/networks/'+encodeURIComponent(name), {method:'DELETE'});
+    toast('Network '+name+' deleted', 'ok');
+    loadProvision();
+  }catch(e){ toast('Delete failed: '+e.message, 'err'); }
+}
+
+function renderProvBin(){
+  const b = provData && provData.agent_binary;
+  $('#binState').textContent = b && b.present
+    ? (b.size/1024/1024).toFixed(2)+' MB uploaded'
+    : 'no agent binary uploaded yet';
+}
+
+async function uploadBinary(){
+  const f = $('#agentBin').files[0];
+  if(!f){ toast('Choose the airgap-agent binary first', 'err'); return; }
+  const t = localStorage.getItem(tokenKey);
+  try{
+    const res = await fetch('/api/provision/agent-binary', {
+      method:'PUT',
+      headers:{'Authorization':'Bearer '+t},
+      body: f
+    });
+    const j = await res.json().catch(()=>({}));
+    if(!res.ok) throw new Error(j.error||res.status);
+    toast('Agent binary uploaded ('+(j.size/1024/1024).toFixed(2)+' MB)', 'ok');
+    loadProvision();
+  }catch(e){ toast('Upload failed: '+e.message, 'err'); }
+}
+
+function renderProvHosts(){
+  const hosts = (provData&&provData.hosts)||[];
+  $('#hostCount').textContent = '('+hosts.length+')';
+  $('#hostEmpty').style.display = hosts.length ? 'none' : 'block';
+  const creds = (provData&&provData.credentials)||[];
+  $('#hostBody').innerHTML = hosts.map(h=>{
+    const fam = h.family||'unknown';
+    const windows = fam==='windows';
+    const status = h.provisioned
+      ? '<span class="badge bg-online">provisioned'+(h.agent_id?' '+esc(h.agent_id):'')+'</span>'
+      : (h.error ? '<span class="badge bg-upd">failed</span>' : '<span class="badge bg-idle">not provisioned</span>');
+    const credOptions = creds.map(c=>`<option value="${esc(c.name)}">${esc(c.name)}</option>`).join('');
+    const action = windows
+      ? '<span class="mut">Windows agent not built yet</span>'
+      : (creds.length
+          ? `<select id="credsel_${esc(h.ip)}">${credOptions}</select> <button class="ghost" onclick="provisionHost('${esc(h.ip)}')">Provision</button>`
+          : '<span class="mut">add a credential first</span>');
+    return `<tr>
+      <td><b>${esc(h.ip)}</b></td>
+      <td class="mut">${(h.ports||[]).join(', ')}</td>
+      <td>${esc(fam)}</td>
+      <td>${esc(h.hostname)||'&ndash;'}</td>
+      <td>${status}</td>
+      <td style="white-space:nowrap">${action}</td>
+    </tr>`;
+  }).join('');
+}
+
+async function provisionHost(ip){
+  const sel = byId('credsel_'+ip);
+  if(!sel){ toast('No credential selected', 'err'); return; }
+  const cred = sel.value;
+  if(!confirm('Push the agent to '+ip+' using credential "'+cred+'"? This installs /usr/local/bin/airgap-agent and starts it.')) return;
+  try{
+    toast('Provisioning '+ip+'&hellip;', '');
+    const r = await api('/api/provision/'+encodeURIComponent(ip), {method:'POST', body: JSON.stringify({credential: cred})});
+    toast((r.ok?'Provisioned ':'Partial: ')+ip+' &rarr; '+r.agent_id+(r.ok?'':': '+r.detail), r.ok?'ok':'err');
+    loadProvision(); loadDevices();
+  }catch(e){ toast('Provision failed: '+e.message, 'err'); }
+}
+
+function renderProvCreds(){
+  const creds = (provData&&provData.credentials)||[];
+  $('#credBody').innerHTML = creds.map(c=>`
+    <tr>
+      <td><b>${esc(c.name)}</b></td>
+      <td>${esc(c.username)}</td>
+      <td>${esc(c.port)}</td>
+      <td>${esc(c.domain)||'&ndash;'}</td>
+      <td><button class="ghost" onclick="delCredential('${esc(c.name)}')">Delete</button></td>
+    </tr>`).join('') || '<tr><td colspan="5" class="mut">no credentials yet</td></tr>';
+}
+
+async function addCredential(){
+  const name = $('#credName').value.trim(), user = $('#credUser').value.trim(), pass = $('#credPass').value;
+  if(!name || !user || !pass){ toast('Name, username and password are required', 'err'); return; }
+  const port = parseInt($('#credPort').value,10) || 22;
+  const domain = $('#credDomain').value.trim();
+  try{
+    await api('/api/credentials', {method:'POST', body: JSON.stringify({name, username:user, password:pass, port, domain})});
+    toast('Credential '+name+' saved', 'ok');
+    ['credName','credUser','credPass','credPort','credDomain'].forEach(i=>byId(i).value='');
+    loadProvision();
+  }catch(e){ toast('Save failed: '+e.message, 'err'); }
+}
+
+async function delCredential(name){
+  if(!confirm('Delete credential '+name+'?')) return;
+  try{
+    await api('/api/credentials/'+encodeURIComponent(name), {method:'DELETE'});
+    toast('Credential '+name+' deleted', 'ok');
+    loadProvision();
   }catch(e){ toast('Delete failed: '+e.message, 'err'); }
 }
 

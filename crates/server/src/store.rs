@@ -74,6 +74,85 @@ pub struct Source {
     pub enabled: bool,
 }
 
+/// A stored set of login credentials used to push the agent to a device over
+/// SSH. Passwords are never serialized back out to the dashboard/API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Credential {
+    pub name: String,
+    pub username: String,
+    /// The SSH password. Always redacted from API/dashboard responses via
+    /// `#[serde(skip_serializing)]`, but persisted on the server disk
+    /// (credentials.json) through a dedicated writer so re-provisioning
+    /// still works after a restart.
+    #[serde(default)]
+    #[serde(skip_serializing)]
+    pub password: String,
+    #[serde(default = "default_port")]
+    pub port: u16,
+    #[serde(default)]
+    pub domain: String,
+    #[serde(default)]
+    pub note: String,
+}
+
+/// Disk-only view of a credential that includes the password. Used so the
+/// public `Credential` type can keep `skip_serializing` on the password.
+#[derive(Serialize)]
+struct CredentialPersist<'a> {
+    name: &'a str,
+    username: &'a str,
+    password: &'a str,
+    port: u16,
+    domain: &'a str,
+    note: &'a str,
+}
+
+impl<'a> From<&'a Credential> for CredentialPersist<'a> {
+    fn from(c: &'a Credential) -> Self {
+        CredentialPersist {
+            name: &c.name,
+            username: &c.username,
+            password: &c.password,
+            port: c.port,
+            domain: &c.domain,
+            note: &c.note,
+        }
+    }
+}
+
+fn default_port() -> u16 {
+    22
+}
+
+/// A saved network range to sweep during discovery.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Network {
+    pub name: String,
+    pub cidr: String,
+    #[serde(default)]
+    pub last_scanned: String,
+}
+
+/// A device found during a discovery sweep.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DiscoveryHost {
+    pub ip: String,
+    #[serde(default)]
+    pub ports: Vec<u16>,
+    #[serde(default)]
+    pub family: String,
+    #[serde(default)]
+    pub hostname: String,
+    #[serde(default)]
+    pub last_scanned: String,
+    #[serde(default)]
+    pub provisioned: bool,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub error: String,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -138,6 +217,9 @@ struct State {
     revoked: HashMap<String, RevokedRecord>,
     policy: Policy,
     sources: Vec<Source>,
+    credentials: Vec<Credential>,
+    networks: Vec<Network>,
+    discovery: Vec<DiscoveryHost>,
 }
 
 pub struct Store {
@@ -166,6 +248,12 @@ impl Store {
             store.read_json("revoked.json").await.unwrap_or_default();
         store.state.write().await.policy =
             store.read_json("policy.json").await.unwrap_or_default();
+        store.state.write().await.credentials =
+            store.read_json("credentials.json").await.unwrap_or_default();
+        store.state.write().await.networks =
+            store.read_json("networks.json").await.unwrap_or_default();
+        store.state.write().await.discovery =
+            store.read_json("discovery.json").await.unwrap_or_default();
         {
             let mut state = store.state.write().await;
             if state.tokens.is_empty() {
@@ -274,6 +362,16 @@ impl Store {
 
     pub async fn update_requests(&self) -> Vec<UpdateRequest> {
         self.state.read().await.updates.clone()
+    }
+
+    pub async fn update_request(&self, id: &str) -> Option<UpdateRequest> {
+        self.state
+            .read()
+            .await
+            .updates
+            .iter()
+            .find(|u| u.id == id)
+            .cloned()
     }
 
     pub async fn promote_update(&self, id: &str) -> Result<UpdateRequest, String> {
@@ -449,6 +547,190 @@ impl Store {
             self.write_json("sources.json", &snap).await;
         }
         removed
+    }
+
+    /// Approved-pending updates that the named agent should install on its
+    /// next poll. Deduplicated per package (newest request wins).
+    pub async fn pending_updates_for_agent(&self, agent_id: &str) -> Vec<UpdateItem> {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for u in &self.state.read().await.updates {
+            if u.agent_id == agent_id
+                && u.status == "approved-pending"
+                && seen.insert(u.package.clone())
+            {
+                out.push(UpdateItem {
+                    id: u.id.clone(),
+                    kind: "package".to_string(),
+                    title: u.package.clone(),
+                    version: u.to_version.clone(),
+                    ring: u.ring.clone(),
+                });
+            }
+        }
+        out
+    }
+
+    /// Records the outcome of an install: the agent reports back after
+    /// running dnf/apt, and the matching request transitions to done/failed.
+    pub async fn mark_update_status(&self, id: &str, status: &str) -> bool {
+        let mut state = self.state.write().await;
+        let Some(req) = state.updates.iter_mut().find(|u| u.id == id) else {
+            return false;
+        };
+        req.status = status.to_string();
+        let snap = state.updates.clone();
+        drop(state);
+        self.write_json("updates.json", &snap).await;
+        true
+    }
+
+    pub async fn enrollment_token(&self) -> Option<String> {
+        self.state.read().await.tokens.keys().next().cloned()
+    }
+
+    pub async fn list_credentials(&self) -> Vec<Credential> {
+        self.state.read().await.credentials.clone()
+    }
+
+    pub async fn get_credential(&self, name: &str) -> Option<Credential> {
+        self.state
+            .read()
+            .await
+            .credentials
+            .iter()
+            .find(|c| c.name == name)
+            .cloned()
+    }
+
+    pub async fn upsert_credential(&self, credential: Credential) {
+        let mut state = self.state.write().await;
+        if let Some(existing) = state
+            .credentials
+            .iter_mut()
+            .find(|c| c.name == credential.name)
+        {
+            *existing = credential;
+        } else {
+            state.credentials.push(credential);
+        }
+        let snap = state.credentials.clone();
+        drop(state);
+        self.write_credentials(&snap).await;
+    }
+
+    pub async fn delete_credential(&self, name: &str) -> bool {
+        let mut state = self.state.write().await;
+        let before = state.credentials.len();
+        state.credentials.retain(|c| c.name != name);
+        let removed = state.credentials.len() != before;
+        let snap = state.credentials.clone();
+        drop(state);
+        if removed {
+            self.write_credentials(&snap).await;
+        }
+        removed
+    }
+
+    /// Persists credentials including passwords. The password is redacted
+    /// from every serialization of `Credential` (API responses), so the
+    /// on-disk copy uses `CredentialPersist` instead.
+    async fn write_credentials(&self, credentials: &[Credential]) {
+        let persist: Vec<CredentialPersist> = credentials.iter().map(Into::into).collect();
+        if let Ok(data) = serde_json::to_vec_pretty(&persist) {
+            let path = self.dir.join("credentials.json");
+            let tmp = self.dir.join("credentials.json.tmp");
+            if tokio::fs::write(&tmp, data).await.is_ok() {
+                let _ = tokio::fs::rename(&tmp, &path).await;
+            }
+        }
+    }
+
+    pub async fn list_networks(&self) -> Vec<Network> {
+        self.state.read().await.networks.clone()
+    }
+
+    pub async fn upsert_network(&self, network: Network) {
+        let mut state = self.state.write().await;
+        if let Some(existing) = state.networks.iter_mut().find(|n| n.name == network.name) {
+            *existing = network;
+        } else {
+            state.networks.push(network);
+        }
+        let snap = state.networks.clone();
+        drop(state);
+        self.write_json("networks.json", &snap).await;
+    }
+
+    pub async fn delete_network(&self, name: &str) -> bool {
+        let mut state = self.state.write().await;
+        let before = state.networks.len();
+        state.networks.retain(|n| n.name != name);
+        let removed = state.networks.len() != before;
+        let snap = state.networks.clone();
+        drop(state);
+        if removed {
+            self.write_json("networks.json", &snap).await;
+        }
+        removed
+    }
+
+    pub async fn set_network_scanned(&self, name: &str, ts: &str) {
+        let mut state = self.state.write().await;
+        if let Some(n) = state.networks.iter_mut().find(|n| n.name == name) {
+            n.last_scanned = ts.to_string();
+        }
+        let snap = state.networks.clone();
+        drop(state);
+        self.write_json("networks.json", &snap).await;
+    }
+
+    pub async fn list_discovery(&self) -> Vec<DiscoveryHost> {
+        self.state.read().await.discovery.clone()
+    }
+
+    pub async fn save_discovery(&self, hosts: Vec<DiscoveryHost>) {
+        let mut state = self.state.write().await;
+        state.discovery = hosts;
+        let snap = state.discovery.clone();
+        drop(state);
+        self.write_json("discovery.json", &snap).await;
+    }
+
+    pub async fn mark_discovery_provisioned(
+        &self,
+        ip: &str,
+        hostname: &str,
+        agent_id: &str,
+        error: &str,
+    ) {
+        let mut state = self.state.write().await;
+        if let Some(h) = state.discovery.iter_mut().find(|h| h.ip == ip) {
+            h.provisioned = error.is_empty();
+            h.hostname = hostname.to_string();
+            h.agent_id = Some(agent_id.to_string());
+            h.error = error.to_string();
+        }
+        let snap = state.discovery.clone();
+        drop(state);
+        self.write_json("discovery.json", &snap).await;
+    }
+
+    pub async fn read_ca_pem(&self) -> Option<String> {
+        tokio::fs::read_to_string(self.dir.join("ca/ca.pem")).await.ok()
+    }
+
+    pub async fn agent_binary_present(&self) -> Option<u64> {
+        tokio::fs::metadata(self.dir.join("provision/airgap-agent"))
+            .await
+            .ok()
+            .map(|m| m.len())
+    }
+
+    pub async fn write_agent_binary(&self, bytes: &[u8]) -> std::io::Result<()> {
+        let dir = self.dir.join("provision");
+        tokio::fs::create_dir_all(&dir).await?;
+        tokio::fs::write(dir.join("airgap-agent"), bytes).await
     }
 }
 

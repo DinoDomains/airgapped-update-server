@@ -1,7 +1,9 @@
 AIRGAP UPDATE PLATFORM - BETA 0.1.0 - RUN MANUAL
 ================================================
 Mutual-TLS update server + isolated agents (M0 milestone).
-Last updated with the RBAC/revocation/policy tranche.
+Last updated with the provisioning + artifact-install tranche (Linux:
+discovery, SSH credential push, and offline dnf/dpkg installs proxied
+through the server).
 
 WHAT THIS IS
 ------------
@@ -68,6 +70,10 @@ RUN THE SERVER (on the machine that will be the update server)
     POST /inventory  agent_id + inventory
     POST /updates    agent_id          -> pending updates list
     POST /report     agent_id + update_id + status
+    POST /artifact   agent_id + update_id + family -> proxied .rpm/.deb bytes
+                     (served ONLY for an approved-pending update, and only to
+                     its target agent; the server is the only online machine,
+                     so isolated agents get artifacts over the mTLS channel)
     GET  /health     -> JSON: status, agents, pending_approvals, last sync
 
   Backup (offline archive of the whole store, run on the server):
@@ -119,6 +125,22 @@ RUN THE SERVER (on the machine that will be the update server)
     GET  /api/operators           list operators (admin only)
     POST /api/operators           create operator (admin only)
     DELETE /api/operators/<name>  delete operator (admin only)
+
+  Provisioning (admin only):
+    GET    /api/provision             networks, discovered hosts, credentials,
+                                      scan status, stored agent binary, server URL
+    GET    /api/networks              saved CIDR ranges to sweep
+    POST   /api/networks              {"name":..,"cidr":..} add a range
+    DELETE /api/networks/<name>       remove a range
+    POST   /api/networks/<name>/scan  sweep the range in the background
+    GET    /api/credentials           stored SSH credential sets (passwords
+                                      are never included in API responses)
+    POST   /api/credentials           {"name":..,"username":..,"password":..,"port":..}
+    DELETE /api/credentials/<name>    remove a credential set
+    POST   /api/provision/<ip>        {"credential":..} push agent + CA over
+                                      SSH (sshpass), enroll, start the agent
+    PUT    /api/provision/agent-binary  upload the agent binary the server
+                                      pushes to hosts (raw body, 100KB-64MB)
 
   Every /api/* call except /api/login requires the session token from login,
   sent as an "Authorization: Bearer <token>" header (the dashboard does this
@@ -181,11 +203,31 @@ RUN THE SERVER (on the machine that will be the update server)
 
 PROVISION AN AGENT (isolated machine)
 -------------------------------------
-  On each agent machine:
-  1. Copy the server's CA certificate to the agent's state dir:
+  Preferred: dashboard-driven provisioning. On the server's dashboard
+  (admin) open the Provision view:
+    1. Upload the agent binary ("Upload agent binary") - this is the file the
+       server pushes to every host it provisions.
+    2. Add a network range (name + CIDR, e.g. 172.16.5.0/24) and click
+       "Scan". The server sweeps the range in the background and lists every
+       host it finds (port 22/445/5985/3389/443/80) with a guessed family.
+       Scans merge into previous results, so already-provisioned hosts keep
+       their agent_id across re-scans.
+    3. Add credential sets ("Add credential"): name, SSH username and
+       password (plus optional port). Passwords are redacted from every API
+       response; the dashboard never displays them.
+    4. Click "Provision" on a discovered host and pick a credential. The
+       server pushes the agent binary + CA over SSH (sshpass, password auth),
+       enrolls the agent with the server's enrollment token, and starts it
+       under nohup on the host. The host card flips to "provisioned" with its
+       agent_id. Re-provisioning restarts the agent so a newly uploaded
+       binary takes effect.
+    5. The agent appears in the Devices view and starts reporting inventory.
+
+  Manually, on each agent machine:
+   1. Copy the server's CA certificate to the agent's state dir:
         scp /var/lib/airgap-server/ca/ca.pem root@<agent>:/var/lib/airgap-agent/ca.pem
-  2. Copy the airgap-agent binary to /usr/local/bin/airgap-agent
-  3. Run once with the enrollment token:
+   2. Copy the airgap-agent binary to /usr/local/bin/airgap-agent
+   3. Run once with the enrollment token:
         AIRGAP_STATE_DIR=/var/lib/airgap-agent \
         AIRGAP_SERVER=https://<server-ip>:8443 \
         AIRGAP_ENROLL_TOKEN=airgap-bootstrap \
@@ -202,6 +244,36 @@ PROVISION AN AGENT (isolated machine)
     AIRGAP_STATE_DIR state directory   DEFAULT: /var/lib/airgap-agent
     AIRGAP_ENROLL_TOKEN                only needed on first enroll
     AIRGAP_POLL_INTERVAL seconds between polls   DEFAULT: 60 (0 = one-shot)
+
+HOW APPROVED UPDATES GET INSTALLED
+----------------------------------
+  1. The catalog records the upstream artifact path for every package it
+     syncs (apt `Filename:` from Packages.gz, dnf `location href` from
+     primary.xml). Old catalogs lack these; refresh the catalog once after
+     upgrading to pick them up.
+  2. Approving a package from a device drawer creates an "approved-pending"
+     update request (dev ring, recorded in updates.json + audit log).
+  3. On its next poll the agent sees the request and calls POST /artifact
+     over mTLS. The server verifies the update is approved-pending AND
+     belongs to that agent, resolves the artifact URL against the whitelisted
+     source, downloads it upstream (the server is the only online host), and
+     streams the bytes back. First fetch is cached in
+     <AIRGAP_STORE_DIR>/artifacts/<update_id>.
+  4. The agent writes the file to its state dir and installs it fully
+     offline:
+       - RHEL:   dnf -y install --disablerepo=* <file.rpm>
+                 (disables all repos; dependencies resolve against the
+                 installed RPM database, so the agent never touches the
+                 internet)
+       - Debian: dpkg -i <file.deb>
+                 (offline; works when the package's dependencies are already
+                 satisfied - otherwise the install fails and the report shows
+                 the dpkg error)
+  5. The agent reports the outcome (code ok/failed + detail, usually the
+     newly installed version), the request becomes done/failed, and the agent
+     re-collects its inventory so the dashboard shows the new version.
+     A failed metadata/DNS error means the agent was running an old binary;
+     re-provision it (the provision script now restarts the agent).
 
 VERIFY / MANUAL TEST
 --------------------
@@ -247,10 +319,22 @@ NETWORKING NOTES
 KNOWN LIMITATIONS (BETA)
 ------------------------
   - JSON file store (no database yet).
-  - "Approve & update" records an approval; actual package install on the
-    agent is the next milestone (agents currently only report versions).
   - Version comparison is best-effort (distro version strings are complex);
-    a few packages may show a stale "latest".
+    a few packages may show a stale "latest" (e.g. Ubuntu's date-style
+    versions can sort wrong), which can make an approval look like a
+    downgrade.
+  - Credential passwords are stored on the server disk in plaintext
+    (credentials.json) so provisioning survives restarts; they are never sent
+    to the dashboard/API. Encrypt-at-rest is planned.
+  - Artifacts are not yet content-signed; integrity today relies on mTLS + the
+    whitelisted upstream source + the manual approval step. (M1 signing work.)
+  - Debian installs use dpkg -i, which is fully offline but does not resolve
+    missing dependencies - an update whose deps aren't already installed
+    fails with a clear dpkg error. A proper offline apt closure solver is
+    future work.
+  - The catalog stores each package's newest version across all enabled
+    suites/sources; a same-version package from a different suite may win the
+    merge and its artifact URL is what gets served.
   - Enrollment token is a single shared secret.
   - Auth sessions are in-memory (expire on server restart).
   - SELinux left Permissive in the lab; needs a hardening pass for prod.

@@ -2,8 +2,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use airgap_proto::{
-    EnrollRequest, EnrollResponse, InventoryRequest, InventoryResponse, PollRequest,
-    PollResponse, RegisterRequest, RegisterResponse, ReportRequest, ReportResponse,
+    ArtifactRequest, EnrollRequest, EnrollResponse, InventoryRequest, InventoryResponse,
+    PollRequest, PollResponse, RegisterRequest, RegisterResponse, ReportRequest, ReportResponse,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -22,6 +22,13 @@ pub struct Client {
     server: String,
     agent_id: String,
     http: reqwest::Client,
+}
+
+/// A downloaded package artifact plus the filename the server derived from
+/// the upstream source, so the agent can install it with dnf/dpkg.
+pub struct ArtifactInfo {
+    pub filename: String,
+    pub bytes: Vec<u8>,
 }
 
 impl Client {
@@ -144,6 +151,37 @@ impl Client {
     #[allow(dead_code)]
     pub async fn report(&self, req: &ReportRequest) -> Result<ReportResponse, ClientError> {
         self.post("/report", req).await
+    }
+
+    /// Fetches the package artifact for an approved update from the server.
+    /// The server streams the .rpm/.deb it proxied from the whitelisted
+    /// upstream source; the agent never needs direct internet access.
+    pub async fn artifact(
+        &self,
+        agent_id: &str,
+        update_id: &str,
+        family: &str,
+    ) -> Result<ArtifactInfo, ClientError> {
+        let url = format!("{}/artifact", self.server);
+        let req = ArtifactRequest {
+            agent_id: agent_id.to_string(),
+            update_id: update_id.to_string(),
+            family: family.to_string(),
+        };
+        let resp = self.http.post(&url).json(&req).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(ClientError::Api(format!("{status}: {text}")));
+        }
+        let filename = resp
+            .headers()
+            .get("x-artifact-filename")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "artifact.bin".to_string());
+        let bytes = resp.bytes().await?.to_vec();
+        Ok(ArtifactInfo { filename, bytes })
     }
 }
 

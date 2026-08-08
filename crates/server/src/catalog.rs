@@ -15,6 +15,10 @@ pub struct LatestPackage {
     pub family: String,
     pub repo: String,
     pub arch: String,
+    /// Relative artifact path within the source (apt `Filename:` or dnf
+    /// `location href`). Absent in catalogs synced by older builds.
+    #[serde(default)]
+    pub location: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -133,6 +137,33 @@ impl Catalog {
             .cloned()
     }
 
+    /// Resolves the full upstream URL of the artifact (rpm/deb) for the
+    /// newest known version of `name` in `family`, by joining the catalog's
+    /// stored relative `location` with the matching whitelisted source's
+    /// base URL. Returns None when the package is unknown or the catalog was
+    /// synced before artifact locations were captured.
+    pub async fn artifact_url(
+        &self,
+        family: &str,
+        name: &str,
+        sources: &[Source],
+    ) -> Option<String> {
+        let pkg = self.latest(name, family).await?;
+        if pkg.location.is_empty() {
+            return None;
+        }
+        let src = if family.eq_ignore_ascii_case("debian") {
+            let suite = pkg.repo.split('/').next().unwrap_or("");
+            sources
+                .iter()
+                .find(|s| s.kind == "apt" && s.suite == suite)
+        } else {
+            sources.iter().find(|s| s.kind == "dnf" && s.name == pkg.repo)
+        }?;
+        let base = src.base_url.trim_end_matches('/');
+        Some(format!("{base}/{}", pkg.location.trim_start_matches('/')))
+    }
+
     pub async fn sync(
         &self,
         client: &reqwest::Client,
@@ -205,6 +236,7 @@ impl Catalog {
                     let name = para.get("Package").cloned().unwrap_or_default();
                     let version = para.get("Version").cloned().unwrap_or_default();
                     let arch = para.get("Architecture").cloned().unwrap_or_default();
+                    let location = para.get("Filename").cloned().unwrap_or_default();
                     if name.is_empty() || version.is_empty() {
                         continue;
                     }
@@ -215,6 +247,7 @@ impl Catalog {
                         DistroFamily::Debian,
                         format!("{}/{}", src.suite, comp),
                         arch,
+                        location,
                     );
                     apt_count += 1;
                 }
@@ -239,6 +272,7 @@ impl Catalog {
                     DistroFamily::Rhel,
                     src.name.clone(),
                     p.2,
+                    p.3,
                 );
                 dnf_count += 1;
             }
@@ -330,7 +364,7 @@ fn primary_location(repomd: &[u8]) -> Option<String> {
     None
 }
 
-fn parse_primary_gz(data: &[u8]) -> Result<Vec<(String, String, String)>, Box<dyn std::error::Error>> {
+fn parse_primary_gz(data: &[u8]) -> Result<Vec<(String, String, String, String)>, Box<dyn std::error::Error>> {
     let mut gz = GzDecoder::new(data);
     let mut xml = Vec::new();
     gz.read_to_end(&mut xml)?;
@@ -343,6 +377,7 @@ fn parse_primary_gz(data: &[u8]) -> Result<Vec<(String, String, String)>, Box<dy
     let mut ver = String::new();
     let mut rel = String::new();
     let mut arch = String::new();
+    let mut location = String::new();
     let mut in_pkg = false;
     let mut cur = String::new();
 
@@ -357,6 +392,7 @@ fn parse_primary_gz(data: &[u8]) -> Result<Vec<(String, String, String)>, Box<dy
                         ver.clear();
                         rel.clear();
                         arch.clear();
+                        location.clear();
                     }
                     "version" => {
                         for a in e.attributes().flatten() {
@@ -385,6 +421,14 @@ fn parse_primary_gz(data: &[u8]) -> Result<Vec<(String, String, String)>, Box<dy
                             rel = v;
                         }
                     }
+                } else if tag == "location" {
+                    for a in e.attributes().flatten() {
+                        let k = String::from_utf8_lossy(a.key.as_ref()).to_string();
+                        let v = String::from_utf8_lossy(&a.value).to_string();
+                        if k == "href" {
+                            location = v;
+                        }
+                    }
                 }
                 cur.clear();
             }
@@ -405,7 +449,7 @@ fn parse_primary_gz(data: &[u8]) -> Result<Vec<(String, String, String)>, Box<dy
                         } else {
                             format!("{ver}-{rel}")
                         };
-                        out.push((name.clone(), version, arch.clone()));
+                        out.push((name.clone(), version, arch.clone(), location.clone()));
                     }
                 }
                 cur.clear();
@@ -437,6 +481,7 @@ fn insert_latest(
     family: DistroFamily,
     repo: String,
     arch: String,
+    location: String,
 ) {
     let family = format!("{family:?}").to_lowercase();
     let key = key_of(&family, &name);
@@ -446,6 +491,7 @@ fn insert_latest(
         family: family.clone(),
         repo,
         arch,
+        location,
     };
     match map.get(&key) {
         Some(existing) if !version_gt(&entry.version, &existing.version) => {}

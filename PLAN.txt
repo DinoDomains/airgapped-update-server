@@ -1,0 +1,243 @@
+================================================================================
+AIR-GAPPED / WSUS-STYLE SECURE UPDATE PLATFORM
+Full Plan, Architecture Design & Requirements
+Project folder: /home/dino/Documents/projects/airgap-update-platform
+================================================================================
+
+1. PROJECT IDEA
+--------------------------------------------------------------------------------
+Build a WSUS-style secure update platform for a DevOps network so that the
+machines in the DevOps department can remain completely isolated from the
+internet, while still receiving OS and software updates that are automatically
+downloaded, tested, approved, and distributed through a central server.
+
+- All update traffic flows THROUGH a central update server (like WSUS).
+- Agents never touch the internet.
+- The server is the only online machine; it pulls updates, tests them, and
+  serves them internally by its IP.
+
+================================================================================
+2. BASIC REQUIREMENTS
+--------------------------------------------------------------------------------
+- Automated, scheduled fetching of updates.
+- Source policy engine: WHITELIST + BLACKLIST of websites/domains that updates
+  may be pulled from; unknown hosts blocked and flagged for admin review;
+  global rules for all source types; every fetch decision audited.
+- OS-agnostic update targets:
+    - OSes: RHEL/Rocky/Alma, Debian/Ubuntu, Windows.
+    - Non-OS software: generic update bundles + git-pull deployments.
+    - Kernel/bootloader handling with alternate-boot-entry testing.
+- Distribution model:
+    - Native mirrors (apt/dnf) served by the server; agents repointed to the
+      server IP.
+    - HTTP content-addressed store for generic bundles.
+- Testing before release:
+    - VM sandbox on a separate KVM test host: boot -> apply -> verify
+      (boot success + installed version + service health + optional smoke
+      script) -> only PASS updates are released.
+- Approval and control:
+    - Human approval per ring (dev -> staging -> prod), scheduling windows.
+    - Web dashboard for approvals, source policy, fleet status, reports, audit.
+- Safety:
+    - Signature verification at every stage, rollback on failure, mTLS
+      identities, immutable audit log.
+- Stack:
+    - Rust throughout (server, agent, test host), Postgres, KVM/libvirt,
+      web dashboard (Rust backend + lightweight SPA).
+
+================================================================================
+3. NETWORK ARCHITECTURE (WSUS-STYLE RELAY)
+--------------------------------------------------------------------------------
+        [ Internet ]
+            |  automated scheduled sync  ->  SOURCE POLICY ENGINE
+            |   (allowlist + blacklist, global, enforced before every fetch)
+            v
+   +-----------------------------------------------+
+   | UPDATE SERVER (the only online machine)       |
+   |  - sync engine: apt/dnf/git/bundle fetch      |
+   |  - source policy engine (allow/deny/audit)    |
+   |  - native mirrors: apt + dnf (per-ring)       |
+   |  - CAS artifact store + git mirror            |
+   |  - catalog + matching engine                  |
+   |  - approval + rings + web dashboard           |
+   |  - internal CA / mTLS for agents              |
+   +-----------------------------------------------+
+        |  internal network - agents route ALL traffic by server IP
+        v
+   +-----------------------------------------------+
+   | TEST HOST (KVM, separate machine)             |
+   |  - VM sandbox: boot -> apply -> verify -> PASS|
+   +-----------------------------------------------+
+        |
+        v
+   Agents: Rocky/Alma/RHEL  |  Ubuntu/Debian  |  Windows
+   inventory -> match -> download -> verify -> apply -> rollback -> report
+
+- DevOps machines have NO direct internet; the server is the single relay
+  (the same role WSUS plays).
+- Earlier USB/air-gap bundle design is retired (kept as an optional manual
+  import fallback; see docs/).
+
+================================================================================
+4. SOURCE POLICY ENGINE
+--------------------------------------------------------------------------------
+- Runs on the server, in software, checked BEFORE any outbound request.
+- Layered on top of the egress firewall (defense in depth).
+- Rules are GLOBAL and apply to all source types: apt repos, dnf repos,
+  git remotes, bundle/artifact URLs.
+- Model: ALLOWLIST (default-deny) + BLACKLIST (hard exclusions).
+    - Allowlist: only hosts listed are fetchable; everything else denied.
+    - Blacklist: extra hard-exclude layer on top (e.g. allow *.example.com
+      but block one specific host inside it).
+- Matching: exact host + wildcard/subdomain (e.g. *.fedoraproject.org)
+  + optional path prefix.
+- Unknown host behavior: BLOCK + flag in dashboard for admin review.
+  Automation keeps running; nothing unknown is ever fetched automatically.
+- Audit log: every fetch decision recorded (host, action, reason, timestamp).
+- Managed via dashboard/API; role-restricted.
+
+================================================================================
+5. SERVER COMPONENTS (Rust)
+--------------------------------------------------------------------------------
+1. Sync engine
+   - Scheduled pulls from upstream: apt/dnf repo metadata + packages,
+     git repos (bare mirror cache), generic bundles.
+   - Upstream signature (GPG) verification before anything is stored.
+2. Source policy engine
+   - Allow/deny/audit as described in section 4.
+3. Native mirrors
+   - Server serves apt and dnf repos over HTTP/HTTPS on its internal IP.
+   - Each ring has its own repo channel; ONLY approved updates appear in a
+     ring's channel (this is the WSUS approval gate).
+4. CAS artifact store
+   - SHA-256 content-addressed HTTP store for generic bundles + git snapshots.
+   - Dedup, signed content.
+5. Catalog + matching engine
+   - Per-update record: type (os-package / kernel / bootloader /
+     generic-bundle / git-deploy), target OS+arch, version, dependencies,
+     applicability conditions, test spec.
+   - Matches approved updates to each machine's inventory.
+6. Approval + rings
+   - dev -> staging -> prod; approve/deny; scheduling windows.
+   - Auto-release ONLY after VM test PASS.
+7. Test orchestrator
+   - Queues VM test jobs to the test host; blocks release until verified.
+8. Identity / CA
+   - Internal CA issuing mTLS client certs per agent.
+   - Default: pre-provisioned certs at deploy time; first-run enrollment
+     token flow also supported.
+9. Agent API (HTTPS, by IP)
+   - /enroll, /register, /inventory, /updates, /report
+10. Web dashboard
+   - Approvals, rings, source policy UI, fleet status, per-update adoption,
+     reports, audit log.
+   - Backend: Rust (axum) + Postgres; frontend: lightweight SPA served by
+     the server.
+
+================================================================================
+6. AGENT COMPONENTS (Rust, cross-platform static binary)
+--------------------------------------------------------------------------------
+1. Enrollment / identity
+   - mTLS client cert; connects to server by its IP over HTTPS.
+2. Inventory
+   - OS / distro / version / arch, kernel, bootloader type (GRUB2,
+     systemd-boot), installed packages + package sources, running services,
+     installed bundles, git checkouts.
+3. Native update module
+   - Points apt/dnf at http://<server-ip>/... repos.
+   - Applies approved updates, gated by ring + maintenance window; reports.
+4. Generic bundle module
+   - Downloads from server CAS store; verifies signature.
+   - Runs bundle manifest install / verify / rollback hooks.
+5. Git-pull module
+   - Pulls pinned revision from server's git mirror; restarts affected
+     services; health-check.
+6. Kernel / bootloader module
+   - Installs new kernel as an ALTERNATE boot entry.
+   - Does NOT flip default until the VM test passed.
+   - Rollback = boot into previous entry.
+7. Rollback safety
+   - Records prior state (package version / bundle / boot entry).
+   - Health-checks after apply; auto-rollback on failure.
+8. Reporting
+   - Pushes status/telemetry to the server.
+
+================================================================================
+7. TEST HOST (separate KVM host)
+--------------------------------------------------------------------------------
+- Receives test jobs from the server.
+- Keeps golden VM images per machine profile (e.g. Rocky 9, Ubuntu 24.04).
+- Per job: boot profile VM -> apply the update (via the same repo/agent
+  logic) -> verify (boot success + installed version + service health +
+  optional smoke script bundled with the update) -> destroy VM -> report
+  PASS/FAIL.
+- Kernel updates get an extra step: the VM must boot into the NEW boot
+  entry before it is allowed to be released.
+
+================================================================================
+8. END-TO-END DATA FLOW
+--------------------------------------------------------------------------------
+1. Automated sync runs; source policy gates every host; verified content
+   lands in mirrors/store. Unknown hosts blocked + flagged.
+2. Admin approves an update for a ring in the dashboard.
+3. Server sends VM test job to the test host -> VM verifies -> PASS.
+4. Server publishes the update to that ring's repo channel -> "releasable".
+5. Agents poll server (HTTPS, by IP); get applicable approved updates;
+   download via native repo or HTTP store.
+6. Agent applies (alternate boot entry for kernels, hooks for bundles,
+   git pull for repos); health-checks; rolls back on failure; reports.
+7. Dashboard shows fleet status + per-update adoption.
+
+================================================================================
+9. REPOSITORY / CODE STRUCTURE
+--------------------------------------------------------------------------------
+airgap-update-platform/
+  Cargo.toml            # workspace
+  crates/
+    proto/              # shared types: API, catalog, inventory, job, policy
+    server/             # sync + policy + mirrors + API + dashboard + CA
+    agent/              # cross-platform agent
+    testhost/           # VM test orchestrator + libvirt driver
+  docs/                 # architecture, bundle-manifest spec, API spec, policy
+  deploy/               # systemd units, repo configs, agent packages
+  keys/                 # key-management notes (no secrets committed)
+
+================================================================================
+10. BUILD ORDER (MILESTONES)
+--------------------------------------------------------------------------------
+M0 - Workspace, proto crate, server API skeleton, agent connect/enroll/
+     inventory, mTLS CA.
+M1 - apt+dnf mirroring; agents repointed at server IP; per-ring approval
+     gating; install + report.  (core "traffic through server" milestone)
+M2 - Source policy engine (allow/deny/audit/dashboard flags).
+M3 - Generic bundles (install/verify/rollback hooks) + git-pull modules.
+M4 - Test host VM sandboxing + release gating.
+M5 - Kernel/bootloader alternate-entry flow.
+M6 - Dashboard, scheduling, reports, audit.
+M7 - Windows agent.
+
+================================================================================
+11. KEY DECISIONS LOG
+--------------------------------------------------------------------------------
+- Server internet model : Server ONLINE (pulls updates itself); agents
+  OFFLINE; devops machines fully isolated.
+- Fetch model            : Native repos (apt/dnf) + HTTP CAS store for
+  generic payloads.
+- Target OSes            : RHEL/Rocky/Alma, Debian/Ubuntu, Windows.
+- Kernel/bootloader      : Managed boot-entry testing (alternate entry,
+  VM boots it, then default flip).
+- Non-OS software        : Generic update bundles + git-pull deployments.
+- VM test checks         : Boot + version + service health + smoke script.
+- Admin console          : Web dashboard.
+- Agent enrollment       : Pre-provisioned client certs (default);
+  first-run token enrollment supported.
+- Source policy          : Allowlist (default-deny) + blacklist (hard
+  exclusions); global rules for all source types; unknown hosts blocked +
+  flagged for admin review; full audit log.
+- Stack                  : Rust (server/agent/testhost), Postgres,
+  KVM/libvirt, web dashboard.
+- Scale                  : Small (<100 nodes), single server + mirrors.
+
+================================================================================
+END OF PLAN
+================================================================================
