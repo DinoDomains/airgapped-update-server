@@ -5,7 +5,10 @@ use std::path::Path;
 use airgap_proto::{
     ArtifactRequest, EnrollRequest, EnrollResponse, InventoryRequest, InventoryResponse,
     PollRequest, PollResponse, RegisterRequest, RegisterResponse, ReportRequest, ReportResponse,
+    RevertReport,
 };
+use futures::StreamExt;
+use tokio::io::AsyncWriteExt;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -26,10 +29,11 @@ pub struct Client {
 }
 
 /// A downloaded package artifact plus the filename the server derived from
-/// the upstream source, so the agent can install it with dnf/dpkg.
+/// the upstream source, so the agent can install it with wusa/dnf/dpkg.
+/// The body is streamed to `dest_dir` to keep memory bounded for large MSUs.
 pub struct ArtifactInfo {
     pub filename: String,
-    pub bytes: Vec<u8>,
+    pub path: std::path::PathBuf,
 }
 
 impl Client {
@@ -157,14 +161,21 @@ impl Client {
         self.post("/report", req).await
     }
 
+    /// Report a revert outcome back to the server (M5/M7).
+    pub async fn revert_report(&self, req: &RevertReport) -> Result<ReportResponse, ClientError> {
+        self.post("/revert-report", req).await
+    }
+
     /// Fetches the package artifact for an approved update from the server.
-    /// The server streams the .rpm/.deb it proxied from the whitelisted
-    /// upstream source; the agent never needs direct internet access.
+    /// The server streams the .rpm/.deb/.msu it proxied from the whitelisted
+    /// upstream source; the agent never needs direct internet access. The
+    /// body is streamed to `dest_dir` so memory stays bounded.
     pub async fn artifact(
         &self,
         agent_id: &str,
         update_id: &str,
         family: &str,
+        dest_dir: &Path,
     ) -> Result<ArtifactInfo, ClientError> {
         let url = format!("{}/artifact", self.server);
         let req = ArtifactRequest {
@@ -184,8 +195,18 @@ impl Client {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string())
             .unwrap_or_else(|| "artifact.bin".to_string());
-        let bytes = resp.bytes().await?.to_vec();
-        Ok(ArtifactInfo { filename, bytes })
+        let dest = dest_dir.join(&filename);
+        let mut file = tokio::fs::File::create(&dest).await?;
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            file.write_all(&chunk).await?;
+        }
+        file.flush().await?;
+        Ok(ArtifactInfo {
+            filename,
+            path: dest,
+        })
     }
 }
 

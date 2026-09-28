@@ -248,6 +248,9 @@ pub struct Store {
 impl Store {
     pub async fn load(dir: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         std::fs::create_dir_all(dir)?;
+        // The store holds enrollment digests, operator records, SSH
+        // credentials and audit history. Restrict it to the service account.
+        crate::fsguard::ensure_dir(dir, crate::fsguard::DIR_MODE)?;
         let store = Store {
             dir: dir.to_path_buf(),
             state: RwLock::new(State::default()),
@@ -272,15 +275,54 @@ impl Store {
             store.read_json("networks.json").await.unwrap_or_default();
         store.state.write().await.discovery =
             store.read_json("discovery.json").await.unwrap_or_default();
+        store.state.write().await.sources =
+            store.read_json("sources.json").await.unwrap_or_default();
         {
             let mut state = store.state.write().await;
-            if state.tokens.is_empty() {
-                let default = std::env::var("AIRGAP_ENROLL_TOKEN")
-                    .unwrap_or_else(|_| "airgap-bootstrap".to_string());
-                state.tokens.insert(default, "default".to_string());
+            // Migrate any legacy plaintext tokens to hashed form. Existing
+            // agents keep working because verification accepts both.
+            let (migrated, changed) = crate::secrets::migrate_hashed(&state.tokens);
+            state.tokens = migrated;
+            let mut changed = changed;
+
+            // `AIRGAP_ENROLL_TOKEN` is authoritative: whatever the operator
+            // puts there is accepted. Tokens are stored only as digests, so
+            // without this there would be no way to introduce a new token
+            // after the initial bootstrap (hand-editing tokens.json used to be
+            // possible when it held plaintext, and no longer is).
+            if let Ok(env) = std::env::var("AIRGAP_ENROLL_TOKEN") {
+                let env = env.trim();
+                if !env.is_empty() {
+                    let digest = crate::secrets::digest(env);
+                    if !state.tokens.contains_key(&digest) {
+                        state.tokens.insert(digest, "env".to_string());
+                        changed = true;
+                        tracing::info!(
+                            "registered AIRGAP_ENROLL_TOKEN as an accepted enrollment token"
+                        );
+                    }
+                }
             }
+
+            // Fall back to a bootstrap token only if nothing else is
+            // configured, so a fresh install is usable.
+            if state.tokens.is_empty() {
+                state
+                    .tokens
+                    .insert(crate::secrets::digest("airgap-bootstrap"), "default".to_string());
+                tracing::warn!(
+                    "no enrollment token configured; seeded the default bootstrap token. \
+                     Set AIRGAP_ENROLL_TOKEN before exposing this server to agents."
+                );
+            }
+
             let tokens = state.tokens.clone();
             drop(state);
+            if changed {
+                tracing::warn!(
+                    "enrollment tokens updated: raw tokens are no longer stored on disk"
+                );
+            }
             store.write_json("tokens.json", &tokens).await;
         }
         {
@@ -313,8 +355,22 @@ impl Store {
         }
     }
 
+    /// Verifies a presented enrollment token against the stored digests.
+    /// Accepts legacy plaintext entries so migration is transparent.
     pub async fn check_token(&self, token: &str) -> bool {
-        self.state.read().await.tokens.contains_key(token)
+        let tokens = self.state.read().await.tokens.clone();
+        crate::secrets::lookup(token, &tokens).is_some()
+    }
+
+    /// Adds a new enrollment token, storing only its digest.
+    pub async fn add_token(&self, raw: &str, label: &str) {
+        let mut state = self.state.write().await;
+        state
+            .tokens
+            .insert(crate::secrets::digest(raw), label.to_string());
+        let snap = state.tokens.clone();
+        drop(state);
+        self.write_json("tokens.json", &snap).await;
     }
 
     pub async fn list_agents(&self) -> Vec<AgentRecord> {
@@ -603,8 +659,46 @@ impl Store {
         true
     }
 
-    pub async fn enrollment_token(&self) -> Option<String> {
-        self.state.read().await.tokens.keys().next().cloned()
+    /// The enrollment token to embed in provisioned agent launch scripts.
+    ///
+    /// Enrollment tokens are stored only as digests, so the raw value cannot
+    /// be recovered from the store. The operator supplies it out-of-band via
+    /// `AIRGAP_ENROLL_TOKEN`; this is deliberate, so that read access to the
+    /// store does not yield a usable enrollment credential.
+    ///
+    /// The supplied value is verified against the stored digests before it is
+    /// returned. Without that check an operator who set a token the server
+    /// does not know about would provision agents that can never enroll, and
+    /// would only find out when the first agent failed to come up.
+    pub async fn enrollment_token(&self) -> Result<String, String> {
+        let raw = std::env::var("AIRGAP_ENROLL_TOKEN").map_err(|_| {
+            "AIRGAP_ENROLL_TOKEN is not set in the server environment. Enrollment \
+             tokens are stored hashed, so the raw value cannot be recovered from \
+             the store; set it to a token the server already accepts before \
+             provisioning agents."
+                .to_string()
+        })?;
+        self.validate_enrollment_token(raw.trim()).await
+    }
+
+    /// Checks a candidate raw enrollment token against the stored digests.
+    ///
+    /// Split out from [`Store::enrollment_token`] so the validation rule can
+    /// be tested without mutating process-global environment state.
+    pub async fn validate_enrollment_token(&self, raw: &str) -> Result<String, String> {
+        if raw.is_empty() {
+            return Err("AIRGAP_ENROLL_TOKEN is set but empty".to_string());
+        }
+        if !self.check_token(raw).await {
+            return Err(
+                "AIRGAP_ENROLL_TOKEN does not match any enrollment token configured on \
+                 this server. Provisioning with it would install agents that cannot \
+                 enroll. Set AIRGAP_ENROLL_TOKEN to an accepted token, or add the token \
+                 to the server first."
+                    .to_string(),
+            );
+        }
+        Ok(raw.to_string())
     }
 
     pub async fn list_credentials(&self) -> Vec<Credential> {

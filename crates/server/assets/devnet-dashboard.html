@@ -1,0 +1,961 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>OpenUpdater — Admin Dashboard</title>
+<style>
+  :root {
+    --bg: #0b0d12;
+    --bg-grad-a: #10131c;
+    --bg-grad-b: #0b0d12;
+    --panel: #151822;
+    --panel-2: #1a1e2b;
+    --border: #262b3a;
+    --text: #eef0f4;
+    --muted: #8b93a1;
+    --green: #3ecf8e;
+    --green-glow: rgba(62,207,142,0.25);
+    --red: #ff6b6b;
+    --red-glow: rgba(255,107,107,0.25);
+    --amber: #f5b942;
+    --amber-glow: rgba(245,185,66,0.25);
+    --blue: #5aa9ff;
+    --blue-glow: rgba(90,169,255,0.25);
+    --purple: #a37bff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: radial-gradient(circle at top left, var(--bg-grad-a), var(--bg-grad-b) 60%);
+    color: var(--text);
+    font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+    margin: 0;
+    padding: 28px 32px 48px;
+    min-height: 100vh;
+  }
+
+  #login-overlay {
+    position: fixed; inset: 0; z-index: 1000;
+    background: radial-gradient(circle at top left, var(--bg-grad-a), var(--bg-grad-b) 60%);
+    display: flex; align-items: center; justify-content: center;
+  }
+  #login-overlay.hidden { display: none; }
+  .login-box {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
+    padding: 32px 30px; width: 340px;
+    box-shadow: 0 0 40px rgba(90,169,255,0.08);
+  }
+  .login-box .login-logo {
+    width: 42px; height: 42px; border-radius: 10px; margin-bottom: 16px;
+    background: linear-gradient(135deg, var(--blue), var(--purple));
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 700; font-size: 17px; color: #05070c;
+  }
+  .login-box h1 { font-size: 20px; margin: 0 0 4px; }
+  .login-box p { color: var(--muted); font-size: 12.5px; margin: 0 0 20px; }
+  .login-fld { margin-bottom: 14px; }
+  .login-fld label { display: block; font-size: 11.5px; color: var(--muted); margin-bottom: 5px; text-transform: uppercase; letter-spacing: 0.05em; }
+  .login-box input {
+    width: 100%; padding: 10px 12px; font-size: 13.5px; color: var(--text);
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; outline: none;
+  }
+  .login-box input:focus { border-color: var(--blue); box-shadow: 0 0 0 3px var(--blue-glow); }
+  .login-err { color: var(--red); font-size: 12px; min-height: 16px; margin: 6px 0 10px; }
+  #login-btn {
+    width: 100%; padding: 10px; border: 0; border-radius: 8px; cursor: pointer; font-size: 13.5px; font-weight: 600;
+    background: linear-gradient(135deg, var(--blue), var(--purple)); color: #05070c;
+  }
+  #login-btn:disabled { opacity: 0.5; cursor: default; }
+  .login-hint { margin-top: 12px; font-size: 11px; color: var(--muted); text-align: center; }
+
+  .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 26px; flex-wrap: wrap; gap: 12px; }  .brand { display: flex; align-items: center; gap: 12px; }
+  .brand .logo {
+    width: 38px; height: 38px; border-radius: 10px;
+    background: linear-gradient(135deg, var(--blue), var(--purple));
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 700; font-size: 16px; color: #05070c;
+    box-shadow: 0 0 24px rgba(90,169,255,0.35);
+  }
+  .brand h1 { font-size: 19px; margin: 0; letter-spacing: 0.01em; }
+  .brand .sub { color: var(--muted); font-size: 12.5px; margin-top: 2px; }
+  .header-right { display: flex; align-items: center; gap: 10px; }
+  .live-pill {
+    display: flex; align-items: center; gap: 8px;
+    background: var(--panel); border: 1px solid var(--border);
+    padding: 7px 14px; border-radius: 999px; font-size: 12.5px; color: var(--muted);
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); box-shadow: 0 0 10px var(--green-glow); animation: pulse 1.6s infinite ease-in-out; }
+  @keyframes pulse { 0%,100%{ opacity:1 } 50%{ opacity:0.4 } }
+
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 22px; }
+  .stat-card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px 18px; position: relative; overflow: hidden; cursor: pointer; transition: border-color .15s, transform .15s, box-shadow .15s; }
+  .stat-card:hover { border-color: var(--blue); transform: translateY(-1px); }
+  .stat-card.active { border-color: var(--blue); box-shadow: 0 0 0 3px var(--blue-glow); }
+  .stat-card .label { cursor: pointer; }
+
+  .pipeline { display: flex; align-items: stretch; gap: 6px; flex-wrap: wrap; }
+  .pipe-node {
+    flex: 1 1 120px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 12px;
+    padding: 14px 10px 12px; text-align: center; cursor: pointer; position: relative;
+    transition: border-color .15s, transform .15s, box-shadow .15s, opacity .2s;
+  }
+  .pipe-node:hover { border-color: var(--blue); box-shadow: 0 0 12px var(--blue-glow); transform: translateY(-1px); }
+  .pipe-node.dim { opacity: 0.4; }
+  .pipe-icon { font-size: 22px; margin-bottom: 6px; }
+  .pipe-label { font-size: 10.5px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.07em; }
+  .pipe-value { font-size: 20px; font-weight: 700; margin-top: 4px; }
+  .pipe-sub { font-size: 11px; color: var(--muted); margin-top: 2px; }
+  .pipe-arrow {
+    align-self: center; flex: 0 0 30px; height: 2px; position: relative;
+    background: repeating-linear-gradient(90deg, var(--blue) 0 6px, transparent 6px 12px);
+    animation: pipeFlow 0.9s linear infinite;
+  }
+  .pipe-arrow::after {
+    content: ''; position: absolute; right: -2px; top: -3px; width: 8px; height: 8px;
+    border-top: 2px solid var(--blue); border-right: 2px solid var(--blue); transform: rotate(45deg);
+  }
+  @keyframes pipeFlow { to { background-position: 12px 0; } }
+  .pipe-latest {
+    margin-top: 12px; padding: 9px 12px; background: var(--panel-2); border: 1px solid var(--border);
+    border-radius: 8px; font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 9px;
+  }
+  .pipe-latest .pulse { width: 8px; height: 8px; border-radius: 50%; background: var(--green); box-shadow: 0 0 8px var(--green-glow); flex: 0 0 auto; }
+  .log-details { margin-top: 12px; }
+  .log-details summary { cursor: pointer; font-size: 12px; color: var(--muted); }
+  .log-details[open] summary { margin-bottom: 8px; }
+  .stat-card::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 3px; }
+  .stat-card.verified::before { background: var(--green); box-shadow: 0 0 12px var(--green-glow); }
+  .stat-card.rejected::before { background: var(--red); box-shadow: 0 0 12px var(--red-glow); }
+  .stat-card.pending::before { background: var(--amber); box-shadow: 0 0 12px var(--amber-glow); }
+  .stat-card.trusted::before { background: var(--blue); box-shadow: 0 0 12px var(--blue-glow); }
+  .stat-card .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; }
+  .stat-card .value { font-size: 30px; font-weight: 700; margin-top: 6px; }
+  .stat-card.verified .value { color: var(--green); }
+  .stat-card.rejected .value { color: var(--red); }
+  .stat-card.pending .value { color: var(--amber); }
+  .stat-card.trusted .value { color: var(--blue); }
+
+  .grid { display: grid; grid-template-columns: 1fr 380px; gap: 20px; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 18px; margin-bottom: 20px; }
+  .panel h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.07em; color: var(--muted); margin: 0 0 14px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .panel h2 .count { background: var(--panel-2); border: 1px solid var(--border); border-radius: 999px; padding: 2px 9px; font-size: 11px; color: var(--text); }
+
+  .top-row { display: grid; grid-template-columns: 220px 1fr; gap: 20px; }
+  .donut-wrap { display: flex; flex-direction: column; align-items: center; justify-content: center; }
+  .donut { width: 150px; height: 150px; border-radius: 50%; display: flex; align-items: center; justify-content: center; position: relative; }
+  .donut .hole { width: 96px; height: 96px; border-radius: 50%; background: var(--panel); display: flex; flex-direction: column; align-items: center; justify-content: center; }
+  .donut .hole .n { font-size: 22px; font-weight: 700; }
+  .donut .hole .l { font-size: 10px; color: var(--muted); text-transform: uppercase; }
+  .legend { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; justify-content: center; }
+  .legend-item { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--muted); }
+  .legend-dot { width: 9px; height: 9px; border-radius: 3px; }
+
+  .search-row { display: flex; gap: 8px; margin-bottom: 12px; }
+  .search-row input {
+    flex: 1; background: #0a0c12; border: 1px solid var(--border); color: var(--text);
+    padding: 8px 10px; border-radius: 7px; font-size: 13px;
+  }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; cursor: pointer; user-select: none; }
+  th:hover { color: var(--text); }
+  th .arrow { font-size: 9px; margin-left: 3px; opacity: 0.6; }
+  tr:last-child td { border-bottom: none; }
+  .badge { display: inline-flex; align-items: center; gap: 5px; padding: 4px 10px; border-radius: 999px; font-size: 11.5px; font-weight: 700; white-space: nowrap; }
+  .badge::before { content: ''; width: 6px; height: 6px; border-radius: 50%; }
+  .badge.PendingVendorApproval { background: var(--amber-glow); color: var(--amber); }
+  .badge.PendingVendorApproval::before { background: var(--amber); }
+  .badge.Downloading { background: var(--blue-glow); color: var(--blue); }
+  .badge.Downloading::before { background: var(--blue); }
+  .badge.Verified { background: var(--green-glow); color: var(--green); }
+  .badge.Verified::before { background: var(--green); }
+  .badge.Rejected, .badge.VendorRejected { background: var(--red-glow); color: var(--red); }
+  .badge.Rejected::before, .badge.VendorRejected::before { background: var(--red); }
+  .detail { color: var(--muted); font-size: 12px; }
+
+  .ep-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 10px; }
+  .dist-card { background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; }
+  .dist-card .domain { font-weight: 700; font-size: 13.5px; margin-bottom: 6px; word-break: break-all; }
+  .dist-card .row { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); margin-top: 3px; }
+  .dist-status { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 10.5px; font-weight: 700; margin-bottom: 6px; }
+  .dist-status.trusted { background: var(--blue-glow); color: var(--blue); }
+  .dist-status.rejected { background: var(--red-glow); color: var(--red); }
+  .dist-status.pending { background: var(--amber-glow); color: var(--amber); }
+
+  .vendor-card { background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px; padding: 14px; margin-bottom: 10px; }
+  .vendor-card .domain { font-weight: 700; margin-bottom: 4px; font-size: 14px; }
+  .vendor-card .btns { display: flex; gap: 8px; margin-top: 10px; }
+  button { border: none; border-radius: 7px; padding: 7px 14px; font-size: 12.5px; cursor: pointer; font-weight: 700; transition: transform 0.08s ease; }
+  button:active { transform: scale(0.96); }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+  .approve { background: var(--green); color: #06231a; }
+  .reject { background: var(--red); color: #2a0808; }
+  .primary { background: var(--blue); color: #05070c; width: 100%; }
+  .usb-select { width: 100%; background: #0a0c12; border: 1px solid var(--border); color: var(--text); padding: 8px 10px; border-radius: 7px; font-size: 13px; margin-top: 6px; }
+  .usb-status { font-size: 12px; color: var(--muted); margin-top: 8px; }
+  .usb-status.ok { color: var(--green); }
+  .usb-status.bad { color: var(--red); }
+  .ep-actions { display: flex; gap: 8px; margin-bottom: 12px; }
+  .ep-card { background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; cursor: pointer; transition: border-color .15s, transform .15s; }
+  .ep-card:hover { border-color: var(--blue); transform: translateY(-1px); }
+  .ep-card .ep-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; cursor: pointer; }
+  .ep-card .ep-host { font-weight: 700; font-size: 14px; }
+  .ep-card .ep-id { font-size: 11px; color: var(--muted); margin-top: 2px; }
+  .ep-status { font-size: 11px; color: var(--muted); display: inline-flex; align-items: center; gap: 5px; border: 1px solid var(--border); border-radius: 999px; padding: 2px 8px; text-transform: capitalize; white-space: nowrap; }
+  .ep-status .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--red); }
+  .ep-status.on { color: var(--green); border-color: rgba(62,207,142,0.35); }
+  .ep-status.on .dot { background: var(--green); box-shadow: 0 0 6px var(--green-glow); }
+  .ep-chev { color: var(--muted); font-size: 11px; transition: transform 0.2s; }
+  .ep-card.open .ep-chev { transform: rotate(180deg); }
+  .ep-detail { display: none; margin-top: 10px; }
+  .ep-card.open .ep-detail { display: block; }
+  .ep-card .ep-os { font-size: 12.5px; margin-bottom: 8px; color: var(--text); }
+  .ep-card .ep-seen { font-size: 11px; color: var(--muted); margin-bottom: 8px; }
+  .ep-card table { width: 100%; }
+  .ep-card th { font-size: 11px; color: var(--muted); text-align: left; padding: 3px 6px; }
+  .ep-card td { font-size: 12.5px; padding: 3px 6px; border-top: 1px solid var(--border); }
+  .ep-card .ep-pkgname { color: var(--muted); }
+  .ep-empty { text-align: center; color: var(--muted); font-size: 13px; padding: 18px 0; }
+  input[type=password] { background: #0a0c12; border: 1px solid var(--border); color: var(--text); padding: 8px 10px; border-radius: 7px; font-size: 13px; width: 100%; margin-top: 6px; }
+  .token-label { color: var(--muted); font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.05em; }
+
+  #logs { background: #07080c; border-radius: 10px; padding: 12px; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; max-height: 220px; overflow-y: auto; line-height: 1.6; }
+  .log-line { color: #9aa3b2; }
+  .log-line.ok { color: var(--green); }
+  .log-line.bad { color: var(--red); }
+  .log-line.admin { color: var(--blue); }
+
+  .timeline { position: relative; padding-left: 18px; }
+  .timeline::before { content: ''; position: absolute; left: 4px; top: 4px; bottom: 4px; width: 2px; background: var(--border); }
+  .t-item { position: relative; padding-bottom: 16px; }
+  .t-item:last-child { padding-bottom: 0; }
+  .t-dot { position: absolute; left: -18px; top: 3px; width: 9px; height: 9px; border-radius: 50%; background: var(--muted); }
+  .t-item.ok .t-dot { background: var(--green); box-shadow: 0 0 8px var(--green-glow); }
+  .t-item.bad .t-dot { background: var(--red); box-shadow: 0 0 8px var(--red-glow); }
+  .t-item.admin .t-dot { background: var(--blue); box-shadow: 0 0 8px var(--blue-glow); }
+  .t-time { font-size: 10.5px; color: var(--muted); }
+  .t-text { font-size: 12.5px; margin-top: 2px; }
+
+  .empty { color: var(--muted); font-size: 13px; padding: 8px 0; }
+
+  /* ── particle canvas ─────────────────────────────────── */
+  #particles { position: fixed; inset: 0; z-index: 0; pointer-events: none; }
+
+  /* ── toast notifications ─────────────────────────────── */
+  #toasts { position: fixed; top: 16px; right: 16px; z-index: 500; display: flex; flex-direction: column; gap: 8px; width: 340px; pointer-events: none; }
+  .toast {
+    pointer-events: auto; background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 12px 14px; display: flex; align-items: flex-start; gap: 10px; font-size: 13px; line-height: 1.45;
+    box-shadow: 0 4px 24px rgba(0,0,0,0.35); transform: translateX(110%); opacity: 0;
+    animation: toastIn 0.35s ease forwards;
+  }
+  .toast.out { animation: toastOut 0.3s ease forwards; }
+  .toast .toast-icon { font-size: 18px; flex: 0 0 auto; margin-top: 1px; }
+  .toast .toast-body { flex: 1; }
+  .toast .toast-title { font-weight: 700; margin-bottom: 2px; }
+  .toast .toast-msg { color: var(--muted); font-size: 12px; }
+  .toast .toast-time { color: var(--muted); font-size: 10px; margin-top: 4px; }
+  .toast.ok { border-left: 3px solid var(--green); }
+  .toast.bad { border-left: 3px solid var(--red); }
+  .toast.info { border-left: 3px solid var(--blue); }
+  @keyframes toastIn { to { transform: translateX(0); opacity: 1; } }
+  @keyframes toastOut { to { transform: translateX(110%); opacity: 0; } }
+
+  /* ── button ripple ────────────────────────────────────── */
+  .ripple { position: relative; overflow: hidden; }
+  .ripple:active::after {
+    content: ''; position: absolute; inset: 0;
+    background: radial-gradient(circle at var(--mx, 50%) var(--my, 50%), rgba(255,255,255,0.25) 0%, transparent 65%);
+    opacity: 0; animation: ripplePop 0.45s ease forwards;
+  }
+  @keyframes ripplePop { 0%{opacity:1;transform:scale(0)} 100%{opacity:0;transform:scale(2.5)} }
+
+  /* ── stat counter live transition ────────────────────── */
+  .stat-card .value { transition: color 0.2s; display: inline-block; }
+  .stat-card .value.bump { animation: counterBump 0.35s ease; }
+  @keyframes counterBump { 0%{transform:scale(1)} 30%{transform:scale(1.2)} 100%{transform:scale(1)} }
+
+  /* ── pipeline node pulse on change ───────────────────── */
+  .pipe-node.pulse-active { animation: nodeGlow 0.7s ease; }
+  @keyframes nodeGlow {
+    0%   { box-shadow: 0 0 0 0 var(--blue-glow); }
+    40%  { box-shadow: 0 0 18px 6px var(--blue-glow); border-color: var(--blue); }
+    100% { box-shadow: 0 0 0 0 transparent; border-color: var(--border); }
+  }
+</style>
+</head>
+<body>
+<canvas id="particles"></canvas>
+<div id="toasts"></div>
+
+<div id="login-overlay">
+  <div class="login-box">
+    <div class="login-logo">OU</div>
+    <h1>OpenUpdater</h1>
+    <p>Sign in to the admin dashboard</p>
+    <div class="login-fld">
+      <label for="login-user">Username</label>
+      <input id="login-user" type="text" autocomplete="username" autofocus>
+    </div>
+    <div class="login-fld">
+      <label for="login-pass">Password</label>
+      <input id="login-pass" type="password" autocomplete="current-password">
+    </div>
+    <div class="login-err" id="login-err"></div>
+    <button id="login-btn" class="ripple">Sign in</button>
+    <div class="login-hint">Default: admin / admin</div>
+  </div>
+</div>
+
+<div class="header">
+  <div class="brand">
+    <div class="logo">OU</div>
+    <div>
+      <h1>OpenUpdater — Admin Dashboard</h1>
+      <div class="sub">Distributor trust &amp; package verification pipeline</div>
+    </div>
+  </div>
+  <div class="header-right">
+    <div class="live-pill"><span class="dot"></span> Live · updates every second</div>
+    <button id="btn-logout" class="ripple" style="background:var(--panel);border:1px solid var(--border);color:var(--muted);border-radius:999px;padding:7px 14px;font-size:12.5px;cursor:pointer;">Sign out</button>
+  </div>
+</div>
+
+<div class="stats">
+  <div class="stat-card verified" onclick="setStatFilter('verified')"><div class="label">Verified</div><div class="value" id="stat-verified">0</div></div>
+  <div class="stat-card rejected" onclick="setStatFilter('rejected')"><div class="label">Rejected</div><div class="value" id="stat-rejected">0</div></div>
+  <div class="stat-card pending" onclick="setStatFilter('pending')"><div class="label">Pending Approval</div><div class="value" id="stat-pending">0</div></div>
+  <div class="stat-card trusted" onclick="setStatFilter('endpoints')"><div class="label">Endpoints</div><div class="value" id="stat-trusted">0</div></div>
+</div>
+
+<div class="grid">
+  <div>
+    <div class="panel">
+      <h2>Endpoint Actions <span class="count" id="ep-count">0 total</span></h2>
+      <div class="ep-actions">
+        <button id="btn-collect" class="approve ripple" style="flex:1;">📥 Collect Information</button>
+        <button id="btn-export" class="primary ripple" style="flex:1;">📤 Compile &amp; Send to USB</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Pipeline Overview <span class="count" id="pkg-count">0 packages</span></h2>
+      <div class="top-row">
+        <div class="donut-wrap">
+          <div class="donut" id="donut"><div class="hole"><span class="n" id="donut-total">0</span><span class="l">packages</span></div></div>
+          <div class="legend" id="legend"></div>
+        </div>
+        <div>
+          <div class="search-row">
+            <input type="text" id="search" placeholder="Search by software or distributor...">
+          </div>
+          <div style="overflow-x:auto;">
+            <table>
+              <thead>
+                <tr>
+                  <th onclick="setSort('name')">Software<span class="arrow" id="arrow-name"></span></th>
+                  <th onclick="setSort('version')">Version<span class="arrow" id="arrow-version"></span></th>
+                  <th onclick="setSort('vendor_domain')">Distributor<span class="arrow" id="arrow-vendor_domain"></span></th>
+                  <th onclick="setSort('status')">Status<span class="arrow" id="arrow-status"></span></th>
+                  <th>Detail</th>
+                </tr>
+              </thead>
+              <tbody id="pkg-rows"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Endpoints <span class="count" id="ep-grid-count">0 total</span></h2>
+      <div class="ep-grid" id="ep-grid"></div>
+    </div>
+
+    <div class="panel">
+      <h2>Update Pipeline <span class="count">live</span></h2>
+      <div class="pipeline" id="pipeline">
+        <div class="pipe-node" data-stage="distributors" onclick="focusStage('distributors')">
+          <div class="pipe-icon">🛰</div>
+          <div class="pipe-label">Distributors</div>
+          <div class="pipe-value" id="pipe-distributors">0</div>
+          <div class="pipe-sub" id="pipe-distributors-sub"></div>
+        </div>
+        <div class="pipe-arrow"></div>
+        <div class="pipe-node" data-stage="server" onclick="focusStage('server')">
+          <div class="pipe-icon">🖥</div>
+          <div class="pipe-label">Air-Gap Server</div>
+          <div class="pipe-value" id="pipe-server">0</div>
+          <div class="pipe-sub" id="pipe-server-sub"></div>
+        </div>
+        <div class="pipe-arrow"></div>
+        <div class="pipe-node" data-stage="usb" onclick="focusStage('usb')">
+          <div class="pipe-icon">💾</div>
+          <div class="pipe-label">USB Transfer</div>
+          <div class="pipe-value" id="pipe-usb">—</div>
+          <div class="pipe-sub" id="pipe-usb-sub"></div>
+        </div>
+        <div class="pipe-arrow"></div>
+        <div class="pipe-node" data-stage="pcs" onclick="focusStage('pcs')">
+          <div class="pipe-icon">🖧</div>
+          <div class="pipe-label">Network PCs</div>
+          <div class="pipe-value" id="pipe-pcs">0</div>
+          <div class="pipe-sub" id="pipe-pcs-sub"></div>
+        </div>
+      </div>
+      <div class="pipe-latest"><span class="pulse"></span><span id="pipe-latest-text">No activity yet.</span></div>
+      <details class="log-details">
+        <summary>Raw activity log</summary>
+        <div id="logs"></div>
+      </details>
+    </div>
+  </div>
+
+  <div>
+    <div class="panel">
+      <h2>🔒 Pending Distributor Approvals</h2>
+      <div class="token-label">Admin token</div>
+      <input type="password" id="admin-token" placeholder="enter admin token">
+      <div id="vendor-list" style="margin-top:14px;"></div>
+    </div>
+
+    <div class="panel">
+      <h2>USB Inventory Transfer</h2>
+      <div class="token-label">Target USB drive</div>
+      <select id="usb-select" class="usb-select"><option value="">— no USB drive detected —</option></select>
+      <div style="display:flex; gap:8px; margin-top:10px;">
+        <button id="btn-refresh-usb" class="reject ripple" style="flex:1;">↻ Refresh</button>
+      </div>
+      <div id="usb-status" class="usb-status">No USB drive selected.</div>
+    </div>
+
+    <div class="panel">
+      <h2>Approval Timeline</h2>
+      <div class="timeline" id="timeline"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const TOKEN_KEY = 'openupdater_token';
+
+function getToken(){ return localStorage.getItem(TOKEN_KEY) || ''; }
+function setToken(t){ if(t) localStorage.setItem(TOKEN_KEY, t); else localStorage.removeItem(TOKEN_KEY); }
+
+async function apiFetch(path, opts){
+  opts = opts || {};
+  opts.headers = Object.assign({}, opts.headers || {});
+  const t = getToken();
+  if(t) opts.headers['Authorization'] = 'Bearer ' + t;
+  const res = await fetch(path, opts);
+  if(res.status === 401){
+    showLogin();
+    throw new Error('login required');
+  }
+  return res;
+}
+
+function showLogin(){
+  document.getElementById('login-overlay').classList.remove('hidden');
+  document.getElementById('login-user').focus();
+}
+
+async function doLogin(){
+  const user = document.getElementById('login-user').value.trim();
+  const pass = document.getElementById('login-pass').value;
+  const btn = document.getElementById('login-btn');
+  const errEl = document.getElementById('login-err');
+  errEl.textContent = '';
+  if(!user || !pass){ errEl.textContent = 'Enter a username and password.'; return; }
+  btn.disabled = true;
+  try{
+    const res = await fetch('/api/login', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({username: user, password: pass})
+    });
+    const data = await res.json();
+    if(!res.ok || !data.token) throw new Error(data.error || 'invalid credentials');
+    setToken(data.token);
+    document.getElementById('login-overlay').classList.add('hidden');
+    startApp();
+  }catch(e){
+    errEl.textContent = e.message || 'Login failed.';
+  }finally{
+    btn.disabled = false;
+  }
+}
+
+async function startApp(){
+  fetchState();
+  refreshUsb();
+  setInterval(fetchState, 1000);
+}
+
+function logout(){
+  setToken(null);
+  showLogin();
+}
+
+const STATUS_COLORS = {
+  Verified: '#3ecf8e', Rejected: '#ff6b6b', VendorRejected: '#ff6b6b',
+  PendingVendorApproval: '#f5b942', Downloading: '#5aa9ff',
+};
+const STATUS_LABELS = {
+  Verified: 'Verified', Rejected: 'Rejected', VendorRejected: 'Vendor Rejected',
+  PendingVendorApproval: 'Pending Approval', Downloading: 'Downloading',
+};
+
+let sortKey = 'name';
+let sortDir = 1;
+let statusFilter = null;
+let lastData = null;
+
+function setSort(key) {
+  if (sortKey === key) { sortDir *= -1; } else { sortKey = key; sortDir = 1; }
+  if (lastData) renderPackages(lastData.packages);
+  updateSortArrows();
+}
+function updateSortArrows() {
+  ['name','version','vendor_domain','status'].forEach(k => {
+    document.getElementById('arrow-' + k).textContent = k === sortKey ? (sortDir === 1 ? '▲' : '▼') : '';
+  });
+}
+
+async function fetchState() {
+  const res = await apiFetch('/api/state');
+  const data = await res.json();
+  lastData = data;
+  renderStats(data.packages, data.trusted_domains, data.endpoints);
+  renderPipeline(data);
+  detectNewLogs(data.logs);
+  renderDonut(data.packages);
+  renderEndpoints(data.endpoints || []);
+  renderPackages(data.packages);
+  renderVendors(data.pending_domains);
+  renderLogs(data.logs);
+  renderTimeline(data.logs);
+}
+
+function renderStats(packages, trusted, endpoints) {
+  const count = s => packages.filter(p => p.status === s).length;
+  animateValue(document.getElementById('stat-verified'), 'verified', count('Verified'));
+  animateValue(document.getElementById('stat-rejected'), 'rejected', count('Rejected') + count('VendorRejected'));
+  animateValue(document.getElementById('stat-pending'), 'pending', count('PendingVendorApproval'));
+  animateValue(document.getElementById('stat-trusted'), 'endpoints', (endpoints || []).length);
+  document.getElementById('pkg-count').textContent = packages.length + ' packages';
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+/* ── animated stat counters ───────────────────────────────── */
+const prevStatVals = {};
+function animateValue(el, key, target) {
+  const prev = prevStatVals[key] ?? null;
+  prevStatVals[key] = target;
+  if (prev === null) { el.textContent = target; return; }
+  if (prev === target) return;
+  el.classList.remove('bump');
+  void el.offsetWidth;
+  el.classList.add('bump');
+  const start = performance.now();
+  const dur = 380;
+  (function tick(now) {
+    const t = Math.min((now - start) / dur, 1);
+    const ease = 1 - Math.pow(1 - t, 3);
+    el.textContent = Math.round(prev + (target - prev) * ease);
+    if (t < 1) requestAnimationFrame(tick);
+    else el.textContent = target;
+  })(start);
+}
+
+/* ── toast notifications ──────────────────────────────────── */
+function showToast(title, msg, type) {
+  type = type || 'info';
+  const icons = { ok: '✅', bad: '❌', info: 'ℹ️' };
+  const now = new Date().toLocaleTimeString();
+  const wrap = document.getElementById('toasts');
+  const el = document.createElement('div');
+  el.className = 'toast ' + type;
+  el.innerHTML =
+    '<span class="toast-icon">' + (icons[type] || '') + '</span>' +
+    '<div class="toast-body"><div class="toast-title">' + title + '</div>' +
+    '<div class="toast-msg">' + escapeHtml(msg) + '</div>' +
+    '<div class="toast-time">' + now + '</div></div>';
+  wrap.prepend(el);
+  while (wrap.children.length > 5) wrap.lastChild.remove();
+  setTimeout(() => { el.classList.add('out'); setTimeout(() => el.remove(), 300); }, 5000);
+}
+let prevLogCount = 0;
+function detectNewLogs(logs) {
+  if (!logs || logs.length <= prevLogCount) { prevLogCount = (logs || []).length; return; }
+  const newLogs = logs.slice(prevLogCount);
+  prevLogCount = logs.length;
+  newLogs.slice(-2).forEach(l => {
+    const isOk = l.includes('✅') || l.includes('ok');
+    const isBad = l.includes('❌') || l.includes('failed');
+    showToast('Activity', l, isOk ? 'ok' : isBad ? 'bad' : 'info');
+  });
+}
+
+/* ── pipeline pulse ───────────────────────────────────────── */
+const prevPipeVals = {};
+function pulsePipeNode(stage) {
+  const val = document.getElementById('pipe-' + stage)?.textContent;
+  if (val && prevPipeVals[stage] !== undefined && prevPipeVals[stage] !== val) {
+    const node = document.querySelector('.pipe-node[data-stage="' + stage + '"]');
+    if (node) { node.classList.remove('pulse-active'); void node.offsetWidth; node.classList.add('pulse-active'); }
+  }
+  if (val) prevPipeVals[stage] = val;
+}
+
+/* ── button ripple (mouse tracking) ───────────────────────── */
+document.addEventListener('mousemove', e => {
+  const btn = e.target.closest('.ripple');
+  if (btn) {
+    const r = btn.getBoundingClientRect();
+    btn.style.setProperty('--mx', ((e.clientX - r.left) / r.width * 100) + '%');
+    btn.style.setProperty('--my', ((e.clientY - r.top) / r.height * 100) + '%');
+  }
+});
+
+/* ── particle background ──────────────────────────────────── */
+(function initParticles() {
+  const canvas = document.getElementById('particles');
+  const ctx = canvas.getContext('2d');
+  let W, H, particles = [];
+  const N = 45, LINK_DIST = 120, SPEED = 0.25;
+  function resize() { W = canvas.width = innerWidth; H = canvas.height = innerHeight; }
+  resize(); addEventListener('resize', resize);
+  for (let i = 0; i < N; i++) particles.push({
+    x: Math.random() * W, y: Math.random() * H,
+    vx: (Math.random() - 0.5) * SPEED, vy: (Math.random() - 0.5) * SPEED,
+    r: Math.random() * 1.5 + 0.8
+  });
+  function draw() {
+    ctx.clearRect(0, 0, W, H);
+    for (let i = 0; i < N; i++) {
+      const a = particles[i];
+      a.x += a.vx; a.y += a.vy;
+      if (a.x < 0 || a.x > W) a.vx *= -1;
+      if (a.y < 0 || a.y > H) a.vy *= -1;
+      for (let j = i + 1; j < N; j++) {
+        const b = particles[j];
+        const dx = a.x - b.x, dy = a.y - b.y, d = Math.sqrt(dx*dx + dy*dy);
+        if (d < LINK_DIST) {
+          ctx.beginPath();
+          ctx.strokeStyle = 'rgba(90,169,255,' + (0.12 * (1 - d / LINK_DIST)) + ')';
+          ctx.lineWidth = 0.8;
+          ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+        }
+      }
+      ctx.beginPath();
+      ctx.fillStyle = 'rgba(90,169,255,0.35)';
+      ctx.arc(a.x, a.y, a.r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    requestAnimationFrame(draw);
+  }
+  draw();
+})();
+
+function renderPipeline(data) {
+  const pkgs = data.packages || [];
+  const eps = data.endpoints || [];
+  const online = eps.filter(e => e.status === 'online').length;
+  const trusted = data.trusted_domains || [];
+  const pendingD = data.pending_domains || [];
+  const verified = pkgs.filter(p => p.status === 'Verified').length;
+  document.getElementById('pipe-distributors').textContent = trusted.length;
+  document.getElementById('pipe-distributors-sub').textContent = pendingD.length ? pendingD.length + ' pending' : 'all approved';
+  document.getElementById('pipe-server').textContent = pkgs.length + ' pkgs';
+  document.getElementById('pipe-server-sub').textContent = verified + ' verified · ready for USB';
+  document.getElementById('pipe-usb').textContent = usbDrives.length ? usbDrives.length + ' drive' : '—';
+  document.getElementById('pipe-usb-sub').textContent = usbDrives.length ? 'ready to write' : 'no USB detected';
+  document.getElementById('pipe-pcs').textContent = eps.length;
+  document.getElementById('pipe-pcs-sub').textContent = online + ' online';
+  ['distributors','server','usb','pcs'].forEach(pulsePipeNode);
+  const lastLog = data.logs && data.logs.length ? data.logs[data.logs.length - 1] : 'No activity yet.';
+  document.getElementById('pipe-latest-text').textContent = lastLog;
+}
+
+function focusStage(stage) {
+  document.querySelectorAll('.pipe-node').forEach(n => n.classList.toggle('dim', n.dataset.stage !== stage));
+  if (stage === 'distributors') document.getElementById('ep-grid').scrollIntoView({behavior: 'smooth', block: 'center'});
+  else if (stage === 'server') setStatFilter('verified');
+  else if (stage === 'usb') document.querySelector('.usb-select').scrollIntoView({behavior: 'smooth', block: 'center'});
+  else if (stage === 'pcs') document.getElementById('ep-grid').scrollIntoView({behavior: 'smooth', block: 'center'});
+  setTimeout(() => document.querySelectorAll('.pipe-node').forEach(n => n.classList.remove('dim')), 1800);
+}
+
+function renderDonut(packages) {
+  const total = packages.length;
+  document.getElementById('donut-total').textContent = total;
+  const donut = document.getElementById('donut');
+  const legend = document.getElementById('legend');
+  if (total === 0) { donut.style.background = '#20242f'; legend.innerHTML = '<span class="empty">No data yet</span>'; return; }
+  const counts = {};
+  packages.forEach(p => { counts[p.status] = (counts[p.status] || 0) + 1; });
+  let acc = 0;
+  const segments = [];
+  Object.entries(counts).forEach(([status, n]) => {
+    const start = (acc / total) * 360; acc += n; const end = (acc / total) * 360;
+    segments.push(`${STATUS_COLORS[status] || '#666'} ${start}deg ${end}deg`);
+  });
+  donut.style.background = `conic-gradient(${segments.join(', ')})`;
+  legend.innerHTML = Object.entries(counts).map(([status, n]) => `
+    <div class="legend-item"><span class="legend-dot" style="background:${STATUS_COLORS[status] || '#666'}"></span>${STATUS_LABELS[status] || status} (${n})</div>
+  `).join('');
+}
+
+function renderEndpoints(endpoints) {
+  const grid = document.getElementById('ep-grid');
+  document.getElementById('ep-grid-count').textContent = endpoints.length + ' total';
+  document.getElementById('ep-count').textContent = endpoints.length + ' total';
+  if (!endpoints.length) {
+    grid.innerHTML = '<div class="ep-empty">No endpoints registered yet — agents will appear here when they enroll and report inventory.</div>';
+    return;
+  }
+  grid.innerHTML = endpoints.map(ep => {
+    const os = ep.os_pretty || (ep.os_name + ' ' + ep.os_version).trim() || '—';
+    const meta = [ep.agent_id, ep.arch, ep.family].filter(Boolean).join(' · ');
+    const last = ep.last_seen ? 'last seen ' + ep.last_seen : '';
+    const online = ep.status === 'online';
+    const pkgs = (ep.packages || []).slice().sort((a, b) => a.name.localeCompare(b.name));
+    const rows = pkgs.length
+      ? pkgs.map(p => `<tr><td class="ep-pkgname">${p.name}</td><td>${p.version}</td></tr>`).join('')
+      : `<tr><td colspan="2" class="ep-pkgname">No package info yet</td></tr>`;
+    return `
+      <div class="ep-card" ondblclick="toggleEpDetails(this)" title="Double-click for details">
+        <div class="ep-head">
+          <div>
+            <div class="ep-host">${ep.hostname}</div>
+            <div class="ep-id">${meta}</div>
+          </div>
+          <div style="display:flex; align-items:center; gap:8px;">
+            <span class="ep-status ${online ? 'on' : ''}"><span class="dot"></span>${ep.status}</span>
+            <span class="ep-chev">▾</span>
+          </div>
+        </div>
+        <div class="ep-detail">
+          <div class="ep-os">${os}</div>
+          <div class="ep-seen">${last}</div>
+          <table>
+            <thead><tr><th>Package</th><th>Version</th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+function toggleEpDetails(el) {
+  el.closest('.ep-card').classList.toggle('open');
+}
+
+const STAT_CARDS = {
+  verified: ['Verified', 'verified'],
+  rejected: ['Rejected', 'VendorRejected', 'rejected'],
+  pending: ['PendingVendorApproval', 'pending'],
+  endpoints: ['endpoints']
+};
+
+function setStatFilter(kind) {
+  if (kind === 'endpoints') {
+    statusFilter = null;
+    trustedFilter = false;
+    document.querySelectorAll('.stat-card').forEach(c => c.classList.remove('active'));
+    document.querySelector('.stat-card.trusted').classList.add('active');
+    renderPackages();
+    document.getElementById('ep-grid').scrollIntoView({behavior: 'smooth', block: 'center'});
+    return;
+  }
+  trustedFilter = false;
+  if (statusFilter === kind) statusFilter = null; else statusFilter = kind;
+  document.querySelectorAll('.stat-card').forEach(c => c.classList.remove('active'));
+  if (statusFilter) document.querySelector('.stat-card.' + statusFilter).classList.add('active');
+  renderPackages();
+  if (statusFilter) document.querySelector('.top-row').scrollIntoView({behavior: 'smooth', block: 'center'});
+}
+
+function renderPackages(packages) {
+  packages = packages || lastData.packages;
+  const search = (document.getElementById('search').value || '').toLowerCase();
+  let filtered = packages.filter(p =>
+    p.name.toLowerCase().includes(search) || p.vendor_domain.toLowerCase().includes(search)
+  );
+  if (statusFilter) filtered = filtered.filter(p => STAT_CARDS[statusFilter].includes(p.status));
+  filtered = filtered.slice().sort((a, b) => {
+    const av = String(a[sortKey]).toLowerCase(), bv = String(b[sortKey]).toLowerCase();
+    return av < bv ? -1 * sortDir : av > bv ? 1 * sortDir : 0;
+  });
+  const tbody = document.getElementById('pkg-rows');
+  if (!filtered.length) { tbody.innerHTML = '<tr><td colspan="5" class="empty">No matching packages.</td></tr>'; return; }
+  tbody.innerHTML = filtered.map(p => `
+    <tr>
+      <td>${p.name}</td><td>${p.version}</td><td>${p.vendor_domain}</td>
+      <td><span class="badge ${p.status}">${STATUS_LABELS[p.status] || p.status}</span></td>
+      <td class="detail">${p.detail}</td>
+    </tr>
+  `).join('');
+}
+
+function renderVendors(domains) {
+  const el = document.getElementById('vendor-list');
+  if (!domains.length) { el.innerHTML = '<div class="empty">No distributors awaiting approval.</div>'; return; }
+  el.innerHTML = domains.map(d => `
+    <div class="vendor-card">
+      <div class="domain">${d}</div>
+      <div class="detail">Requesting to supply update packages to this network.</div>
+      <div class="btns">
+        <button class="approve" onclick="decide('${d}', true)">Approve</button>
+        <button class="reject" onclick="decide('${d}', false)">Reject</button>
+      </div>
+    </div>
+  `).join('');
+}
+
+function classifyLog(line) {
+  if (line.includes('✅')) return 'ok';
+  if (line.includes('❌')) return 'bad';
+  if (line.includes('👤')) return 'admin';
+  return '';
+}
+
+function renderLogs(logs) {
+  const el = document.getElementById('logs');
+  const wasAtBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 10;
+  el.innerHTML = logs.map(l => `<div class="log-line ${classifyLog(l)}">${l}</div>`).join('');
+  if (wasAtBottom) el.scrollTop = el.scrollHeight;
+}
+
+function renderTimeline(logs) {
+  const el = document.getElementById('timeline');
+  const recent = logs.slice(-8).reverse();
+  if (!recent.length) { el.innerHTML = '<div class="empty">No activity yet.</div>'; return; }
+  el.innerHTML = recent.map(l => {
+    const cls = classifyLog(l);
+    const match = l.match(/^\[(\d{2}:\d{2}:\d{2})\]\s*(.*)$/);
+    const time = match ? match[1] : '';
+    const text = match ? match[2] : l;
+    return `<div class="t-item ${cls}"><div class="t-dot"></div><div class="t-time">${time}</div><div class="t-text">${text}</div></div>`;
+  }).join('');
+}
+
+async function decide(domain, approve) {
+  const token = document.getElementById('admin-token').value;
+  const endpoint = approve ? '/api/vendor/approve' : '/api/vendor/reject';
+  const res = await apiFetch(endpoint, {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({domain, admin_token: token})
+  });
+  const result = await res.json();
+  if (!result.ok) alert('Action failed: ' + (result.error || 'unknown error'));
+  fetchState();
+}
+
+let usbDrives = [];
+function setUsbStatus(msg, cls) {
+  const el = document.getElementById('usb-status');
+  el.textContent = msg;
+  el.className = 'usb-status ' + (cls || '');
+}
+
+async function refreshUsb() {
+  const btn = document.getElementById('btn-refresh-usb');
+  const select = document.getElementById('usb-select');
+  btn.disabled = true;
+  try {
+    const res = await apiFetch('/api/usb');
+    usbDrives = await res.json();
+    select.innerHTML = usbDrives.length
+      ? usbDrives.map((d, i) =>
+          `<option value="${i}">${d.label} — ${d.device} (${d.fstype})</option>`
+        ).join('')
+      : '<option value="">— no USB drive detected —</option>';
+    if (usbDrives.length) setUsbStatus('Ready: ' + usbDrives.length + ' USB drive(s) found.', 'ok');
+    else setUsbStatus('No removable USB drive detected.', 'bad');
+    if (lastData) renderPipeline(lastData);
+  } catch (e) {
+    setUsbStatus('USB detection failed: ' + e, 'bad');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function collectInventory() {
+  const btn = document.getElementById('btn-collect');
+  btn.disabled = true;
+  setUsbStatus('Requesting agents to re-report inventory…');
+  try {
+    const res = await apiFetch('/api/collect', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'
+    });
+    const result = await res.json();
+    setUsbStatus(result.ok
+      ? 'Collect requested — agents will report on next poll.'
+      : 'Collect failed: ' + (result.error || 'unknown error'), result.ok ? 'ok' : 'bad');
+  } catch (e) {
+    setUsbStatus('Collect failed: ' + e, 'bad');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function exportOutbound() {
+  const select = document.getElementById('usb-select');
+  const btn = document.getElementById('btn-export');
+  if (select.value === '') { setUsbStatus('Select a USB drive first.', 'bad'); return; }
+  const drive = usbDrives[parseInt(select.value, 10)];
+  if (!drive) { setUsbStatus('Selected drive no longer detected.', 'bad'); return; }
+  btn.disabled = true;
+  setUsbStatus('Signing and writing OUTBOUND bundle to ' + drive.mount_point + '…');
+  try {
+    const res = await apiFetch('/api/export-outbound', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        mount_point: drive.mount_point,
+        drive_id: drive.device.replace('/dev/', ''),
+        session: null
+      })
+    });
+    const result = await res.json();
+    if (result.ok) {
+      setUsbStatus('Exported session #' + result.session + ' with ' + result.devices + ' device(s) → ' + drive.mount_point, 'ok');
+    } else {
+      setUsbStatus('Export failed: ' + (result.error || 'unknown error'), 'bad');
+    }
+  } catch (e) {
+    setUsbStatus('Export failed: ' + e, 'bad');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+document.getElementById('btn-refresh-usb').addEventListener('click', refreshUsb);
+document.getElementById('btn-collect').addEventListener('click', collectInventory);
+document.getElementById('btn-export').addEventListener('click', exportOutbound);
+document.getElementById('login-btn').addEventListener('click', doLogin);
+document.getElementById('login-pass').addEventListener('keydown', e => { if(e.key === 'Enter') doLogin(); });
+document.getElementById('login-user').addEventListener('keydown', e => { if(e.key === 'Enter') doLogin(); });
+document.getElementById('btn-logout').addEventListener('click', logout);
+
+document.getElementById('search').addEventListener('input', () => { if (lastData) renderPackages(lastData.packages); });
+updateSortArrows();
+
+// Boot: require a valid session before showing any dashboard data.
+(async () => {
+  const t = getToken();
+  if(!t){ showLogin(); return; }
+  try{
+    const res = await apiFetch('/api/state');
+    if(res.status === 200){ startApp(); }
+  }catch(_){ /* apiFetch already showed the login */ }
+})();
+</script>
+
+</body>
+</html>

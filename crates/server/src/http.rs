@@ -1211,7 +1211,23 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
   .chip { display:inline-block; padding:2px 8px; border-radius:10px; font-size:11px; font-weight:700; }
   .chip.ok { background:#052e16; color:var(--ok); } .chip.upd { background:#431407; color:var(--upd); }
   .chip.blocked { background:#3f1d1d; color:var(--red); }
-  .ringpipe { display:grid; grid-template-columns:repeat(3,1fr); gap:16px; margin-top:16px; }
+  .ringpipe { display:flex; flex-direction:row; gap:10px; margin-top:16px; align-items:stretch; }
+  .ringpipe .ringcol { flex:1; min-width:0; }
+  .ringpipe .ringarrow { flex:0 0 auto; align-self:center; font-size:22px; }
+  .patch-legend { display:flex; gap:16px; font-size:12px; color:var(--mut); margin-bottom:8px; }
+  .stacked { display:flex; height:22px; border-radius:6px; overflow:hidden; background:#0b1526; }
+  .stacked .seg { height:100%; transition:width .5s ease; }
+  .pcard { border:1px solid var(--line); border-radius:8px; padding:12px 14px; margin-bottom:10px; background:var(--panel); }
+  .pcard .ptop { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  .pcard .ptop b { font-size:13px; }
+  .pcard .ptop .mut { font-size:11px; }
+  .pbar { position:relative; height:12px; background:#0b1526; border-radius:6px; overflow:hidden; margin-top:10px; }
+  .pbar .fill { height:100%; transition:width .5s ease; }
+  .pbar .segments { position:absolute; inset:0; display:flex; }
+  .pbar .segments i { flex:1; border-right:1px solid rgba(0,0,0,.35); }
+  .pbar .segments i:last-child { border-right:0; }
+  .pstage { display:flex; justify-content:space-between; font-size:10px; color:var(--mut); margin-top:4px; }
+  .pcard .pmeta { display:flex; gap:14px; font-size:11px; color:var(--mut); margin-top:6px; flex-wrap:wrap; }
   .ringcol { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; }
   .ringcard { background:var(--bg); border:1px solid var(--line); border-radius:6px; padding:10px; margin-bottom:8px; font-size:12px; }
   #catPages { display:flex; gap:6px; } #catPages .active { color:var(--ac); border-color:var(--ac); }
@@ -1244,6 +1260,30 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
          border-radius:6px; padding:10px 12px; font-size:12px; }
   .evt .t { color:var(--mut); white-space:nowrap; } .evt .a { font-weight:700; } .evt .act { color:var(--ac); }
   .evt .tg { color:var(--mut); word-break:break-all; } .evt .r { margin-left:auto; }
+  .kpis { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:12px; margin:16px 0; }
+  .kpi { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px 16px; }
+  .kpi .n { font-size:26px; font-weight:800; line-height:1; }
+  .kpi .l { font-size:11px; color:var(--mut); text-transform:uppercase; letter-spacing:.6px; margin-top:6px; }
+  .kpi .s { font-size:11px; color:var(--mut); margin-top:4px; }
+  .charts { display:grid; grid-template-columns:1.2fr 1fr; gap:16px; margin-top:16px; }
+  @media (max-width:900px){ .charts { grid-template-columns:1fr; } }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; }
+  .panel h3 { font-size:14px; margin:0 0 12px; }
+  .donut-row { display:flex; align-items:center; gap:18px; flex-wrap:wrap; }
+  .donut-legend { display:grid; grid-template-columns:1fr 1fr; gap:6px 16px; flex:1; min-width:220px; }
+  .legend-item { display:flex; align-items:center; gap:8px; font-size:12px; }
+  .legend-item .sw { width:10px; height:10px; border-radius:3px; flex:0 0 10px; }
+  .legend-item .cnt { margin-left:auto; font-weight:700; }
+  .hbar-row { display:flex; align-items:center; gap:10px; margin-bottom:8px; font-size:12px; }
+  .hbar-lbl { width:80px; color:var(--mut); text-transform:capitalize; }
+  .hbar-track { flex:1; background:#0b1526; border-radius:4px; height:12px; overflow:hidden; }
+  .hbar-fill { height:100%; border-radius:4px; transition:width .4s ease; }
+  .hbar-val { width:32px; text-align:right; font-weight:700; }
+  #devSearch { flex:1; min-width:180px; }
+  .card .bar { height:4px; background:#0b1526; border-radius:2px; overflow:hidden; margin-top:10px; }
+  .card .bar .f { height:100%; background:var(--ac); transition:width .4s ease; }
+  @keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:.4;} }
+  .pulse { animation:pulse 2s infinite; }
 </style>
 </head>
 <body>
@@ -1271,9 +1311,10 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 <main>
   <div class="layout">
     <nav>
-      <button class="active" data-view="devices" onclick="showView('devices')">Devices<small>fleet inventory &amp; versions</small></button>
+      <button class="active" data-view="overview" onclick="showView('overview')">Overview<small>fleet health at a glance</small></button>
+      <button data-view="devices" onclick="showView('devices')">Devices<small>fleet inventory &amp; versions</small></button>
       <button data-view="approvals" onclick="showView('approvals')">Approvals<small>pending update requests</small></button>
-      <button data-view="rings" onclick="showView('rings')">Rings<small>dev &rarr; staging &rarr; prod</small></button>
+      <button data-view="patches" onclick="showView('patches')">Patch status<small>live update progress &amp; results</small></button>
       <button data-view="catalog" onclick="showView('catalog')">Catalog<small>upstream package versions</small></button>
       <button data-view="audit" onclick="showView('audit')">Audit log<small>who did what</small></button>
       <button data-view="policy" id="navPolicy" style="display:none" onclick="showView('policy')">Policy<small>allowlist / default-deny (admin)</small></button>
@@ -1282,12 +1323,39 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       <button data-view="operators" id="navOperators" style="display:none" onclick="showView('operators')">Operators<small>accounts &amp; roles (admin)</small></button>
     </nav>
 
-    <div class="view active" id="viewDevices">
+    <div class="view active" id="viewOverview">
+      <div class="headline">
+        <h2>Overview</h2><span class="muted" id="ovTime"></span>
+        <span style="flex:1"></span>
+        <button class="ghost" onclick="loadOverview()">Refresh</button>
+      </div>
+      <div class="kpis" id="ovKpis"></div>
+      <div class="charts">
+        <div class="panel">
+          <h3>Fleet health</h3>
+          <div class="donut-row">
+            <svg id="ovDonut" width="150" height="150" viewBox="0 0 42 42"></svg>
+            <div class="donut-legend" id="ovLegend"></div>
+          </div>
+        </div>
+        <div class="panel">
+          <h3>Updates available by platform</h3>
+          <div id="ovBars"></div>
+        </div>
+      </div>
+      <div class="panel" style="margin-top:16px">
+        <h3>Recent activity</h3>
+        <div class="timeline" id="ovActivity"></div>
+      </div>
+    </div>
+
+    <div class="view" id="viewDevices">
       <div class="headline">
         <h2>Devices</h2><span class="muted" id="devCount"></span>
         <span class="muted" style="margin-left:auto">click a device to view its packages</span>
       </div>
       <div class="toolbar">
+        <input id="devSearch" placeholder="filter devices&hellip;" oninput="renderDevices()">
         <button onclick="refreshCatalog()" id="refreshBtn">Refresh package catalog</button>
         <button class="ghost" onclick="loadDevices()">Refresh devices</button>
         <button class="ghost" onclick="scanAll()">Scan all devices</button>
@@ -1308,15 +1376,24 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       <div class="headline"><h2>Approvals</h2><span class="muted" id="apprCount"></span></div>
       <div class="empty" id="apprEmpty" style="display:none">No update requests yet. Approve an update from a device&rsquo;s packages drawer.</div>
       <table style="margin-top:12px">
-        <thead><tr><th>When</th><th>Package</th><th>Device</th><th>From &rarr; To</th><th>Ring</th><th>Approved by</th><th>Status</th></tr></thead>
+        <thead><tr><th>When</th><th>Package</th><th>Device</th><th>From &rarr; To</th><th>Approved by</th><th>Status</th></tr></thead>
         <tbody id="apprBody"></tbody>
       </table>
     </div>
 
-    <div class="view" id="viewRings">
-      <div class="headline"><h2>Rings</h2><span class="muted">promote a release down the pipeline: dev &rarr; staging &rarr; prod</span></div>
-      <div class="empty" id="ringEmpty" style="display:none">No releases available yet. Push packages to the server repo, then refresh the package catalog.</div>
-      <div class="ringpipe" id="ringPipe"></div>
+    <div class="view" id="viewPatches">
+      <div class="headline"><h2>Patch status</h2><span class="muted" id="patchCount"></span></div>
+      <div class="panel" style="cursor:default">
+        <h3 style="margin:0 0 8px;font-size:14px">Fleet patch coverage</h3>
+        <div class="patch-legend"><span class="legend-item"><span class="sw" style="background:var(--ok)"></span>patched</span><span class="legend-item"><span class="sw" style="background:var(--upd)"></span>needs updates</span><span class="legend-item"><span class="sw" style="background:var(--mut)"></span>offline / unknown</span></div>
+        <div class="stacked" id="covStack"></div>
+        <div class="mut" style="font-size:11px;margin-top:6px" id="covDetail"></div>
+      </div>
+      <div class="panel" style="margin-top:16px;cursor:default">
+        <h3 style="margin:0 0 12px;font-size:14px">Update progress</h3>
+        <div class="empty" id="patchEmpty" style="display:none">No updates approved yet. Approve an update from a device&rsquo;s package drawer and it will show up here with a live progress bar.</div>
+        <div id="patchList"></div>
+      </div>
     </div>
 
     <div class="view" id="viewCatalog">
@@ -1555,6 +1632,91 @@ function statusPill(s){
   return '<span class="badge bg-idle">'+esc(s||'unknown')+'</span>';
 }
 
+const FAM_COLORS = { debian:'#22c55e', rhel:'#f97316', windows:'#38bdf8', other:'#94a3b8' };
+let ovTimer = null;
+
+async function loadOverview(){
+  try{
+    const [devs, health, upds, audit] = await Promise.all([
+      api('/api/devices'), api('/api/health'), api('/api/updates'), api('/api/audit')
+    ]);
+    renderKpis(devs, health, upds);
+    renderDonut(devs);
+    renderBars(devs);
+    renderActivity(audit);
+    $('#ovTime').textContent = 'updated '+new Date().toLocaleTimeString();
+  }catch(e){ toast('Failed to load overview: '+e.message, 'err'); }
+}
+
+function renderKpis(devs, health, upds){
+  const online = devs.filter(d=>d.status==='online').length;
+  const upd = devs.reduce((a,d)=>a+(d.updates_available||0),0);
+  const pending = (health && health.pending_approvals != null)
+    ? health.pending_approvals
+    : upds.filter(u=>u.status==='approved-pending').length;
+  const kpis = [
+    {n:devs.length, l:'Devices', s:''},
+    {n:online, l:'Online', s:devs.length?Math.round(online/devs.length*100)+'%':'', c:'var(--ok)'},
+    {n:upd, l:'Updates available', s:'', c:upd?'var(--upd)':'var(--ok)'},
+    {n:pending, l:'Pending approvals', s:'', c:pending?'var(--upd)':'var(--mut)'},
+  ];
+  $('#ovKpis').innerHTML = kpis.map(k=>
+    `<div class="kpi"><div class="n" style="color:${k.c||'var(--txt)'}">${k.n}</div><div class="l">${k.l}</div>${k.s?`<div class="s">${k.s}</div>`:''}</div>`
+  ).join('');
+}
+
+function renderDonut(devs){
+  const online = devs.filter(d=>d.status==='online' && (d.updates_available||0)===0).length;
+  const upd = devs.filter(d=>d.status==='online' && (d.updates_available||0)>0).length;
+  const offline = devs.length - online - upd;
+  const segs = [
+    {l:'Up to date', n:online, c:'var(--ok)'},
+    {l:'Updates pending', n:upd, c:'var(--upd)'},
+    {l:'Offline / not seen', n:offline, c:'var(--mut)'},
+  ];
+  const total = Math.max(1, devs.length);
+  const R = 15.9, C = 2*Math.PI*R;
+  let off = 0;
+  let circles = '';
+  segs.forEach(s=>{
+    const frac = Math.max(0, s.n/total);
+    circles += `<circle r="${R}" cx="21" cy="21" fill="transparent" stroke="${s.c}" stroke-width="3.5"
+      stroke-dasharray="${(frac*C).toFixed(3)} ${(C-frac*C).toFixed(3)}" stroke-dashoffset="${off.toFixed(3)}"
+      transform="rotate(-90 21 21)"></circle>`;
+    off -= frac*C;
+  });
+  $('#ovDonut').innerHTML = circles +
+    `<text x="21" y="21" text-anchor="middle" dominant-baseline="central" fill="var(--txt)" font-size="7" font-weight="800">${devs.length}</text>`;
+  $('#ovLegend').innerHTML = segs.map(s=>
+    `<div class="legend-item"><span class="sw" style="background:${s.c}"></span>${s.l}<span class="cnt">${s.n}</span></div>`
+  ).join('');
+}
+
+function renderBars(devs){
+  const fam = {};
+  devs.forEach(d=>{ fam[d.family]=(fam[d.family]||0)+(d.updates_available||0); });
+  const rows = Object.entries(fam).sort((a,b)=>b[1]-a[1]);
+  const max = Math.max(1, ...rows.map(r=>r[1]));
+  $('#ovBars').innerHTML = rows.length ? rows.map(([f,n])=>`
+    <div class="hbar-row">
+      <span class="hbar-lbl">${esc(f)||'other'}</span>
+      <div class="hbar-track"><div class="hbar-fill" style="width:${Math.round(n/max*100)}%;background:${FAM_COLORS[f]||'var(--mut)'}"></div></div>
+      <span class="hbar-val">${n}</span>
+    </div>`).join('') : '<div class="mut">no devices reporting yet</div>';
+}
+
+function renderActivity(audit){
+  const rows = (audit||[]).slice(-8).reverse();
+  $('#ovActivity').innerHTML = rows.length ? rows.map(e=>`
+    <div class="evt">
+      <span class="t">${rel(e.ts)}</span>
+      <span class="a">${esc(e.actor||'&ndash;')}</span>
+      <span class="act">${esc(e.action)}</span>
+      <span class="tg">${esc(e.target||'')}</span>
+      <span class="r ${e.result==='ok'?'ok':'upd'}">${esc(e.result)}</span>
+    </div>`).join('') : '<div class="mut">no activity yet</div>';
+}
+
 async function doLogin(){
   const u = $('#user').value.trim(), p = $('#pass').value;
   $('#loginErr').textContent = '';
@@ -1596,9 +1758,10 @@ function showView(v){
   document.querySelectorAll('nav button').forEach(b=>b.classList.remove('active'));
   $('#view'+v.charAt(0).toUpperCase()+v.slice(1)).classList.add('active');
   document.querySelector('nav button[data-view="'+v+'"]').classList.add('active');
+  if(v==='overview'){ loadOverview(); }
   if(v==='devices'){ loadDevices(); }
   if(v==='approvals'){ loadApprovals(); }
-  if(v==='rings'){ loadRings(); }
+  if(v==='patches'){ loadPatches(); }
   if(v==='catalog'){ searchCatalog(1); }
   if(v==='audit'){ loadAudit(); }
   if(v==='operators'){ loadOperators(); }
@@ -1614,7 +1777,7 @@ async function boot(){
   try{
     const me = await api('/api/me');
     enterApp(me.operator, me.role);
-    loadDevices(); loadHealth(); loadApprovals();
+    loadOverview(); loadHealth(); loadApprovals(); loadDevices();
   }catch(_){ localStorage.removeItem(tokenKey); showLogin(); }
 }
 
@@ -1631,12 +1794,27 @@ async function loadHealth(){
   }
 }
 
+let allDevices = [];
+
 async function loadDevices(){
   try{
+    allDevices.length = 0;
     const devs = await api('/api/devices');
-    $('#devCount').textContent = '('+devs.length+')';
-    $('#emptyState').style.display = devs.length ? 'none' : 'block';
-    $('#devGrid').innerHTML = devs.map(d=>`
+    devs.forEach(d=>allDevices.push(d));
+    renderDevices();
+  }catch(e){ toast('Failed to load devices: '+e.message, 'err'); }
+}
+
+function renderDevices(){
+  const q = ($('#devSearch').value||'').toLowerCase();
+  const devs = allDevices.filter(d=>
+    !q || (d.hostname||'').toLowerCase().includes(q) || (d.id||'').toLowerCase().includes(q)
+       || (d.os_pretty||'').toLowerCase().includes(q) || (d.ip||'').toLowerCase().includes(q));
+  $('#devCount').textContent = '('+devs.length+'/'+allDevices.length+')';
+  $('#emptyState').style.display = devs.length ? 'none' : 'block';
+  $('#devGrid').innerHTML = devs.map(d=>{
+    const pct = d.packages>0 ? Math.min(100, Math.round((d.packages - (d.updates_available||0)) / d.packages * 100)) : 0;
+    return `
       <div class="card" onclick="openDrawer('${esc(d.id)}')">
         <div class="top">${familyIcon(d.family)}
           <div style="min-width:0">
@@ -1659,12 +1837,13 @@ async function loadDevices(){
             ? '<span class="badge bg-upd">'+d.updates_available+' update'+(d.updates_available===1?'':'s')+' available</span>'
             : '<span class="badge bg-idle">up to date</span>'}
         </div>
+        ${d.packages>0?`<div class="bar"><div class="f" style="width:${pct}%"></div></div>`:''}
         <div style="display:flex;gap:8px;margin-top:12px">
           <button class="ghost" style="flex:1" onclick="event.stopPropagation();scanDevice('${esc(d.id)}')">Scan for updates</button>
           <button class="ghost" style="flex:1" onclick="event.stopPropagation();openDrawer('${esc(d.id)}')">View packages</button>
         </div>
-      </div>`).join('');
-  }catch(e){ toast('Failed to load devices: '+e.message, 'err'); }
+      </div>`;
+  }).join('');
 }
 
 let drawerId = null, drawerRows = [], drawerSort = {key:'name', dir:1};
@@ -1788,9 +1967,8 @@ async function loadApprovals(){
         <td><b>${esc(u.package)}</b></td>
         <td>${esc(u.agent_id)}</td>
         <td>${esc(u.from_version)} &rarr; ${esc(u.to_version)}</td>
-        <td><span class="badge bg-idle">${esc(u.ring)}</span></td>
         <td>${esc(u.approved_by||'&ndash;')}</td>
-        <td><span class="chip upd">${esc(u.status)}</span></td>
+        <td>${patchPhase(u).label==='Verified'?'<span class="chip ok">verified</span>':patchPhase(u).label==='Failed'?'<span class="chip blocked">failed</span>':'<span class="chip upd">'+esc(u.status)+'</span>'}</td>
       </tr>`).join('');
   }catch(e){ toast('Failed to load approvals: '+e.message, 'err'); }
 }
@@ -1849,37 +2027,63 @@ async function delOp(name){
   }catch(e){ toast('Delete failed: '+e.message, 'err'); }
 }
 
-const RING_COLS = ['dev', 'staging', 'prod'];
-async function loadRings(){
+const PATCH_PHASES = [
+  { key:'approved-pending', label:'Approved', pct:35, color:'var(--upd)', note:'waiting for the agent to install' },
+  { key:'done', label:'Verified', pct:100, color:'var(--ok)', note:'installed and confirmed by the agent' },
+  { key:'failed', label:'Failed', pct:100, color:'var(--red)', note:'install failed - agent reported an error' },
+];
+
+async function loadPatches(){
   try{
-    const groups = await api('/api/rings');
-    const has = Object.values(groups).some(a=>a.length);
-    $('#ringEmpty').style.display = has ? 'none' : 'block';
-    $('#ringPipe').innerHTML = RING_COLS.map((r,i)=>{
-      const items = (groups[r]||[]);
-      const canPromote = (role==='approver'||role==='admin') && i < 2;
-      return `<div class="ringcol">
-        <h3 style="font-size:14px;margin:0 0 10px;text-transform:capitalize">${esc(r)} <span class="badge bg-idle">${items.length}</span></h3>
-        ${items.length ? items.map(u=>`
-          <div class="ringcard">
-            <b>${esc(u.package)}</b>
-            <div class="id">${esc(u.agent_id)}</div>
-            <div class="mut">${esc(u.from_version)} &rarr; <b>${esc(u.to_version)}</b></div>
-            <div class="mut">approved by ${esc(u.approved_by||'&ndash;')} &middot; ${rel(u.ts)}</div>
-            ${canPromote ? `<button class="ghost" style="margin-top:8px" onclick="promote('${esc(u.id)}')">Promote to ${RING_COLS[i+1]}</button>` : ''}
-          </div>`).join('') : '<div class="mut">empty</div>'}
-      </div>`;
-    }).join('');
-  }catch(e){ toast('Failed to load rings: '+e.message, 'err'); }
+    const [devs, upds] = await Promise.all([ api('/api/devices'), api('/api/updates') ]);
+    renderCovStack(devs);
+    renderPatchList(upds);
+  }catch(e){ toast('Failed to load patch status: '+e.message, 'err'); }
 }
 
-async function promote(id){
-  if(!confirm('Promote this release to the next ring?')) return;
-  try{
-    const r = await api('/api/update/'+encodeURIComponent(id)+'/promote', {method:'POST'});
-    toast('Promoted '+r.package+' to '+r.ring, 'ok');
-    loadRings(); loadApprovals(); loadDevices();
-  }catch(e){ toast('Promote failed: '+e.message, 'err'); }
+function renderCovStack(devs){
+  const patched = devs.filter(d=>d.status==='online' && (d.updates_available||0)===0).length;
+  const pending = devs.filter(d=>d.status==='online' && (d.updates_available||0)>0).length;
+  const offline = Math.max(0, devs.length - patched - pending);
+  const tot = Math.max(1, devs.length);
+  const seg = (n,c)=>`<div class="seg" style="width:${n/tot*100}%;background:${c}"></div>`;
+  $('#covStack').innerHTML =
+    seg(patched,'var(--ok)') + seg(pending,'var(--upd)') + seg(offline,'var(--mut)');
+  $('#covDetail').textContent = devs.length
+    ? patched+' patched · '+pending+' need updates · '+offline+' offline · '+Math.round(patched/tot*100)+'% of fleet up to date'
+    : 'no devices reporting yet';
+}
+
+function patchPhase(u){
+  return PATCH_PHASES.find(p=>p.key===u.status) || { label:u.status||'unknown', pct:50, color:'var(--mut)', note:'' };
+}
+
+function renderPatchList(upds){
+  const rows = upds.slice().reverse();
+  $('#patchCount').textContent = '('+rows.length+' update'+(rows.length===1?'':'s')+')';
+  $('#patchEmpty').style.display = rows.length ? 'none' : 'block';
+  $('#patchList').innerHTML = rows.map(u=>{
+    const ph = patchPhase(u);
+    const pct = ph.pct;
+    const active = u.status === 'approved-pending';
+    return `
+    <div class="pcard">
+      <div class="ptop">
+        <b>${esc(u.package)}</b>
+        <span class="mut">on ${esc(u.agent_id)}</span>
+        <span class="mut">${esc(u.from_version)} &rarr; <b>${esc(u.to_version)}</b></span>
+        <span style="margin-left:auto"><span class="chip" style="background:${ph.color};color:#0b1526">${esc(ph.label)}</span></span>
+      </div>
+      <div class="pbar"><div class="fill ${active?'pulse':''}" style="width:${pct}%;background:${ph.color}"></div></div>
+      <div class="pstage">
+        <span>Approved</span><span>Installing</span><span>Verified</span>
+      </div>
+      <div class="pmeta">
+        <span>${ph.note}</span>
+        <span>approved by ${esc(u.approved_by||'&ndash;')} &middot; ${rel(u.ts)}</span>
+      </div>
+    </div>`;
+  }).join('');
 }
 
 let catTimer = null;
@@ -2197,6 +2401,17 @@ async function delCredential(name){
 
 setInterval(()=>{ document.querySelectorAll('[data-ls]').forEach(el=>{ el.textContent = rel(el.dataset.ls); }); }, 15000);
 setInterval(loadHealth, 30000);
+setInterval(()=>{
+  const v = document.querySelector('nav button.active');
+  if(!v) return;
+  const name = v.dataset.view;
+  if(name==='overview') loadOverview();
+  else if(name==='devices') loadDevices();
+  else if(name==='approvals') loadApprovals();
+  else if(name==='patches') loadPatches();
+  else if(name==='audit') loadAudit();
+  else if(name==='catalog') searchCatalog(1);
+}, 20000);
 $('#pass').addEventListener('keydown', e=>{ if(e.key==='Enter') doLogin(); });
 
 boot();

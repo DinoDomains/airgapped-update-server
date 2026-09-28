@@ -3,11 +3,12 @@ use std::time::Duration;
 
 use airgap_proto::{
     DistroFamily, InventoryRequest, PollRequest, RegisterRequest, ReportRequest, ReportStatus,
-    UpdateItem,
+    RevertCommand, RevertOutcome, UpdateItem,
 };
 
 mod client;
 mod inventory;
+pub mod revert;
 
 const DEFAULT_SERVER: &str = "https://172.16.5.20:8443";
 #[cfg(unix)]
@@ -78,7 +79,7 @@ async fn apply_updates_batch(
                 continue;
             }
         };
-        let artifact = match client.artifact(agent_id, &update.id, fam).await {
+        let artifact = match client.artifact(agent_id, &update.id, fam, &state_dir).await {
             Ok(a) => a,
             Err(e) => {
                 results.push((update.id.clone(), "failed".to_string(), format!("artifact fetch failed: {e}")));
@@ -103,11 +104,16 @@ async fn apply_updates_batch(
             };
             format!("update-{}.{}", update.id, ext)
         };
-        let path = state_dir.join(filename);
-        if let Err(e) = std::fs::write(&path, &artifact.bytes) {
-            results.push((update.id.clone(), "failed".to_string(), format!("write artifact: {e}")));
-            continue;
-        }
+        let path = if artifact.filename == filename {
+            artifact.path
+        } else {
+            let dest = state_dir.join(&filename);
+            if let Err(e) = tokio::fs::rename(&artifact.path, &dest).await {
+                results.push((update.id.clone(), "failed".to_string(), format!("rename artifact: {e}")));
+                continue;
+            }
+            dest
+        };
         staged.push((update.id.clone(), pkg.clone(), path));
     }
 
@@ -258,6 +264,24 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
                 })
                 .await?;
             tracing::info!("scan complete - inventory re-reported");
+        }
+
+        if !poll.revert_commands.is_empty() {
+            tracing::info!("processing {} revert command(s)", poll.revert_commands.len());
+            for cmd in &poll.revert_commands {
+                let outcome = revert::execute_revert(&client, &agent_id, cmd).await;
+                tracing::info!("revert {} -> {:?}", cmd.package, outcome);
+                client
+                    .revert_report(&airgap_proto::RevertReport {
+                        agent_id: agent_id.clone(),
+                        package: cmd.package.clone(),
+                        target_version: cmd.target_version.clone(),
+                        command_id: cmd.command_id.clone(),
+                        outcome: outcome.clone(),
+                        executed_at: chrono::Utc::now().to_rfc3339(),
+                    })
+                    .await?;
+            }
         }
 
         if !poll.updates.is_empty() {

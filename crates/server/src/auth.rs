@@ -13,6 +13,16 @@ pub const ROLE_ADMIN: &str = "admin";
 
 const SESSION_TTL_SECS: u64 = 24 * 3600;
 
+/// On-disk representation of a session. The raw token is never written;
+/// `token_hash` is the SHA-256 digest used for lookup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionRecord {
+    token_hash: String,
+    operator: String,
+    role: String,
+    expires: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Operator {
     pub name: String,
@@ -23,6 +33,7 @@ pub struct Operator {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Session {
+    /// The raw bearer token, returned to the client exactly once at login.
     pub token: String,
     pub operator: String,
     pub role: String,
@@ -31,22 +42,37 @@ pub struct Session {
 
 pub struct Auth {
     operators: RwLock<Vec<Operator>>,
-    sessions: Mutex<HashMap<String, Session>>,
-    path: PathBuf,
+    sessions: Mutex<HashMap<String, SessionRecord>>,
+    operators_path: PathBuf,
+    sessions_path: PathBuf,
 }
 
 impl Auth {
     pub async fn load(dir: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         std::fs::create_dir_all(dir)?;
-        let path = dir.join("operators.json");
-        let ops: Vec<Operator> = std::fs::read(&path)
+        crate::fsguard::ensure_dir(dir, crate::fsguard::DIR_MODE)?;
+        let operators_path = dir.join("operators.json");
+        let sessions_path = dir.join("sessions.json");
+        let ops: Vec<Operator> = std::fs::read(&operators_path)
             .ok()
             .and_then(|data| serde_json::from_slice(&data).ok())
             .unwrap_or_default();
+        // Load persisted sessions, dropping any that already expired.
+        let now: u64 = now_ts().parse().unwrap_or(0);
+        let stored: Vec<SessionRecord> = std::fs::read(&sessions_path)
+            .ok()
+            .and_then(|data| serde_json::from_slice(&data).ok())
+            .unwrap_or_default();
+        let sessions: HashMap<String, SessionRecord> = stored
+            .into_iter()
+            .filter(|s| s.expires >= now)
+            .map(|s| (s.token_hash.clone(), s))
+            .collect();
         let auth = Auth {
             operators: RwLock::new(ops),
-            sessions: Mutex::new(HashMap::new()),
-            path,
+            sessions: Mutex::new(sessions),
+            operators_path,
+            sessions_path,
         };
         if auth.operators.read().await.is_empty() {
             let pw = std::env::var("AIRGAP_ADMIN_PASSWORD").unwrap_or_else(|_| "admin".to_string());
@@ -58,10 +84,15 @@ impl Auth {
                 created_at: now_ts(),
             };
             auth.operators.write().await.push(admin);
-            auth.save().await;
-            tracing::warn!(
-                "created default operator 'admin' (set AIRGAP_ADMIN_PASSWORD to change it)"
-            );
+            auth.save_operators().await;
+            if pw == "admin" {
+                tracing::warn!(
+                    "created default operator 'admin' with the default password; \
+                     set AIRGAP_ADMIN_PASSWORD before exposing this server"
+                );
+            } else {
+                tracing::warn!("created default operator 'admin' from AIRGAP_ADMIN_PASSWORD");
+            }
         }
         Ok(auth)
     }
@@ -88,31 +119,72 @@ impl Auth {
         if !Auth::verify_password(pw, &op.pass_hash) {
             return None;
         }
-        let token = gen_token();
+        let token = crate::secrets::random_token();
         let now: u64 = now_ts().parse().unwrap_or(0);
-        let s = Session {
-            token: token.clone(),
+        let record = SessionRecord {
+            token_hash: crate::secrets::digest(&token),
             operator: op.name.clone(),
             role: op.role.clone(),
             expires: now + SESSION_TTL_SECS,
         };
-        self.sessions.lock().await.insert(token, s.clone());
-        Some(s)
+        let session = Session {
+            token: token.clone(),
+            operator: record.operator.clone(),
+            role: record.role.clone(),
+            expires: record.expires,
+        };
+        drop(ops);
+        self.sessions
+            .lock()
+            .await
+            .insert(crate::secrets::digest(&token), record);
+        self.save_sessions().await;
+        Some(session)
     }
 
+    /// Resolves a presented bearer token to a live session.
     pub async fn session(&self, token: &str) -> Option<Session> {
+        let hash = crate::secrets::digest(token);
         let mut sessions = self.sessions.lock().await;
-        let s = sessions.get(token).cloned()?;
         let now: u64 = now_ts().parse().unwrap_or(0);
-        if s.expires < now {
-            sessions.remove(token);
+        let expired = match sessions.get(&hash) {
+            Some(s) => s.expires < now,
+            None => return None,
+        };
+        if expired {
+            sessions.remove(&hash);
+            drop(sessions);
+            self.save_sessions().await;
             return None;
         }
-        Some(s)
+        let s = sessions.get(&hash)?;
+        Some(Session {
+            token: token.to_string(),
+            operator: s.operator.clone(),
+            role: s.role.clone(),
+            expires: s.expires,
+        })
     }
 
     pub async fn logout(&self, token: &str) {
-        self.sessions.lock().await.remove(token);
+        let removed = self
+            .sessions
+            .lock()
+            .await
+            .remove(&crate::secrets::digest(token))
+            .is_some();
+        if removed {
+            self.save_sessions().await;
+        }
+    }
+
+    /// Drops all sessions for an operator, e.g. after a password change.
+    pub async fn revoke_operator_sessions(&self, name: &str) {
+        {
+            let mut sessions = self.sessions.lock().await;
+            sessions.retain(|_, s| s.operator != name);
+        }
+        self.save_sessions().await;
     }
 
     pub async fn list_operators(&self) -> Vec<Operator> {
@@ -138,6 +210,9 @@ impl Auth {
         if !matches!(role, "viewer" | "approver" | "admin") {
             return Err("invalid role".to_string());
         }
+        if pw.len() < 12 {
+            return Err("password must be at least 12 characters".to_string());
+        }
         let hash = Auth::hash_password(pw).map_err(|e| e.to_string())?;
         let op = Operator {
             name: name.to_string(),
@@ -146,7 +221,7 @@ impl Auth {
             created_at: now_ts(),
         };
         self.operators.write().await.push(op);
-        self.save().await;
+        self.save_operators().await;
         Ok(())
     }
 
@@ -157,7 +232,8 @@ impl Auth {
         let removed = ops.len() != before;
         drop(ops);
         if removed {
-            self.save().await;
+            self.save_operators().await;
+            self.revoke_operator_sessions(name).await;
         }
         removed
     }
@@ -171,17 +247,35 @@ impl Auth {
         rank(&session.role) >= rank(min_role)
     }
 
-    async fn save(&self) {
+    async fn save_operators(&self) {
         let ops = self.operators.read().await.clone();
-        let data = serde_json::to_vec_pretty(&ops).unwrap_or_default();
-        let tmp = self
-            .path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join("operators.json.tmp");
-        if std::fs::write(&tmp, data).is_ok() {
-            let _ = std::fs::rename(&tmp, &self.path);
+        write_atomic_private(&self.operators_path, &ops);
+    }
+
+    async fn save_sessions(&self) {
+        let sessions: Vec<SessionRecord> = self
+            .sessions
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect();
+        write_atomic_private(&self.sessions_path, &sessions);
+    }
+}
+
+/// Writes JSON to `path` with `0600` via a temp file + rename, so a crash
+/// mid-write cannot leave a truncated or world-readable file behind.
+fn write_atomic_private<T: Serialize>(path: &Path, value: &T) {
+    let data = match serde_json::to_vec_pretty(value) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!(error = %e, path = %path.display(), "failed to serialize state");
+            return;
         }
+    };
+    if let Err(e) = crate::fsguard::write_secret(path, &data) {
+        tracing::error!(error = %e, path = %path.display(), "failed to persist state");
     }
 }
 

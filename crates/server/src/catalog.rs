@@ -8,6 +8,39 @@ use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 
+/// Persisted map of host -> known-good IPv4 edge addresses. Microsoft's CDN
+/// round-robins its DNS answer across edges and will happily hand out edges
+/// that accept TCP+TLS but never answer HTTP; once an edge delivers bytes we
+/// remember it so later fetches try it first.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct EdgeCache {
+    /// host -> Vec<ip> (most recently proven first)
+    hosts: HashMap<String, Vec<String>>,
+}
+
+fn load_edge_cache(path: &Path) -> EdgeCache {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_edge_cache(path: &Path, cache: &EdgeCache) {
+    if let Ok(s) = serde_json::to_string_pretty(cache) {
+        let _ = std::fs::write(path, s);
+    }
+}
+
+fn remember_edge(cache_path: Option<&Path>, host: &str, ip: std::net::IpAddr) {
+    let Some(path) = cache_path else { return };
+    let mut cache = load_edge_cache(path);
+    let list = cache.hosts.entry(host.to_string()).or_default();
+    let ip = ip.to_string();
+    list.retain(|e| e != &ip);
+    list.insert(0, ip);
+    save_edge_cache(path, &cache);
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LatestPackage {
     pub name: String,
@@ -74,16 +107,20 @@ const APT_ARCH: &str = "amd64";
 pub fn build_client(sources: &[Source]) -> reqwest::Client {
     use std::net::ToSocketAddrs;
     let mut builder = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120));
-    for host in upstream_hosts(sources).into_iter().chain(
+        .timeout(std::time::Duration::from_secs(120))
+        // The Microsoft Update Catalog serves a JS-blocked page to clients
+        // without a browser User-Agent.
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36");
+    for (host, port) in upstream_hosts(sources).into_iter().chain(
         // Windows artifact hosts are not listed in the source config (the
         // catalog source's base_url is the search site) but are used when
         // proxying .msu files - pin them too so they never stall on IPv6.
-        EXTRA_PINNED_HOSTS.iter().map(|h| h.to_string()),
+        EXTRA_PINNED_HOSTS.iter().map(|h| (h.to_string(), 443u16)),
     ) {
-        if let Ok(addr) = format!("{host}:80").to_socket_addrs() {
-            if let Some(a) = addr.filter(|a| a.is_ipv4()).next() {
-                builder = builder.resolve(&host, a);
+        if let Ok(addr) = format!("{host}:{port}").to_socket_addrs() {
+            let addrs: Vec<_> = addr.filter(|a| a.is_ipv4()).collect();
+            if !addrs.is_empty() {
+                builder = builder.resolve_to_addrs(&host, &addrs);
             }
         }
     }
@@ -98,16 +135,22 @@ const EXTRA_PINNED_HOSTS: &[&str] = &[
     "download.microsoft.com",
 ];
 
-fn upstream_hosts(sources: &[Source]) -> Vec<String> {
-    let mut hosts = Vec::new();
+/// Hosts from the configured sources, resolved on the scheme-appropriate
+/// port (plain http mirrors are contacted on 80, everything else on 443).
+fn upstream_hosts(sources: &[Source]) -> Vec<(String, u16)> {
+    let mut hosts: Vec<(String, u16)> = Vec::new();
     for s in sources {
         let base = s.base_url.trim_end_matches('/');
-        let rest = base.strip_prefix("http://").or_else(|| base.strip_prefix("https://"));
-        if let Some(h) = rest {
-            if let Some(host) = h.split('/').next() {
-                if !hosts.iter().any(|x| x == host) {
-                    hosts.push(host.to_string());
-                }
+        let (scheme, rest) = if let Some(r) = base.strip_prefix("http://") {
+            ("http", r)
+        } else if let Some(r) = base.strip_prefix("https://") {
+            ("https", r)
+        } else {
+            continue;
+        };
+        if let Some(host) = rest.split('/').next() {
+            if !hosts.iter().any(|(h, _)| h == host) {
+                hosts.push((host.to_string(), if scheme == "http" { 80 } else { 443 }));
             }
         }
     }
@@ -394,6 +437,285 @@ async fn fetch(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("read {url}: {e}"))
 }
 
+/// Resolve every unique IPv4 for an upstream host. The catalog hostname
+/// round-robins across CDN edges, some of which accept TCP+TLS but stall on
+/// the HTTP request, so we gather the whole address set to try each edge
+/// with its own pinned client. Known-good edges from previous fetches are
+/// tried first (fresh DNS first, then remembered ones).
+fn resolve_ipv4_candidates(host: &str, edge_cache: Option<&Path>) -> Vec<std::net::IpAddr> {
+    use std::net::ToSocketAddrs;
+    let mut ips: Vec<std::net::IpAddr> = Vec::new();
+    for _ in 0..8 {
+        if let Ok(addr) = format!("{host}:443").to_socket_addrs() {
+            for a in addr.filter(|a| a.is_ipv4()) {
+                if !ips.contains(&a.ip()) {
+                    ips.push(a.ip());
+                }
+            }
+        }
+        if ips.len() >= 12 {
+            break;
+        }
+    }
+    if let Some(path) = edge_cache {
+        let cache = load_edge_cache(path);
+        if let Some(remembered) = cache.hosts.get(host) {
+            for ip in remembered {
+                if let Ok(ip) = ip.parse::<std::net::IpAddr>() {
+                    if !ips.contains(&ip) {
+                        ips.push(ip);
+                    }
+                }
+            }
+        }
+    }
+    ips
+}
+
+/// Builds a client pinned to one specific upstream edge IP.
+pub fn client_for_edge(host: &str, ip: std::net::IpAddr, body_timeout: std::time::Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(body_timeout)
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+        .resolve(host, std::net::SocketAddr::new(ip, 443))
+        .build()
+        .expect("failed to build http client")
+}
+
+/// Fetch `url` resiliently: the catalog hostname round-robins across CDN
+/// edges, some of which accept TCP+TLS but stall on the HTTP request (the
+/// pinned client would wait out its 120s timeout on a dead edge). Resolve
+/// every unique IPv4, then try each with its own client and a short
+/// per-attempt timeout so a working edge is reached quickly.
+pub async fn fetch_resilient(
+    sources: &[Source],
+    url: &str,
+    per_attempt: std::time::Duration,
+    edge_cache_path: Option<&Path>,
+) -> Result<Vec<u8>, String> {
+    let host = url
+        .split("://")
+        .nth(1)
+        .and_then(|rest| rest.split('/').next())
+        .unwrap_or("")
+        .to_string();
+    if host.is_empty() {
+        return fetch(&build_client(sources), url).await;
+    }
+
+    let ips = resolve_ipv4_candidates(&host, edge_cache_path);
+    tracing::debug!("fetch_resilient {host} -> {} candidates", ips.len());
+
+    let mut last_err: Option<String> = None;
+    for ip in ips {
+        let client = client_for_edge(&host, ip, std::time::Duration::from_secs(600));
+        // Headers must arrive quickly; a dead edge stalls here. The body may
+        // be large (hundreds of MB of .msu), so it gets the full timeout.
+        let resp = match tokio::time::timeout(per_attempt, client.get(url).send()).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                let msg = format!("GET {url}: {e}");
+                tracing::debug!("fetch_resilient {ip}: {msg}");
+                last_err = Some(msg);
+                continue;
+            }
+            Err(_) => {
+                let msg = format!("GET {url}: header timeout");
+                tracing::debug!("fetch_resilient {ip}: {msg}");
+                last_err = Some(msg);
+                continue;
+            }
+        };
+        if !resp.status().is_success() {
+            let msg = format!("GET {url}: HTTP {}", resp.status());
+            tracing::debug!("fetch_resilient {ip}: {msg}");
+            last_err = Some(msg);
+            continue;
+        }
+        match resp.bytes().await {
+            Ok(bytes) => {
+                remember_edge(edge_cache_path, &host, ip);
+                tracing::debug!("fetch_resilient ok via {ip}");
+                return Ok(bytes.to_vec());
+            }
+            Err(e) => {
+                let msg = format!("read {url}: {e}");
+                tracing::debug!("fetch_resilient {ip}: {msg}");
+                last_err = Some(msg);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| format!("no candidates for {host}")))
+}
+
+/// Streaming upstream fetch with per-edge fallthrough and byte-range resume.
+///
+/// `offset` is the byte offset to resume from (0 = start of file). Each edge
+/// is requested with `Range: bytes={offset}-`; the server either answers
+/// `206 Partial Content` (range honored) or `200` (whole body, only valid
+/// when offset == 0). If an edge dies mid-body, the next edge resumes from
+/// the last delivered byte so a huge artifact can complete across edges.
+///
+/// Returns an `mpsc` receiver that yields body chunks; on total failure an
+/// `Err` chunk is sent before the channel closes. `total` is the upstream
+/// size when disclosed via Content-Length / Content-Range. When `cache` is
+/// set, every chunk is appended to that file before it is forwarded, so a
+/// partial download survives a dropped client and resumes next request.
+pub async fn stream_resilient(
+    sources: &[Source],
+    url: &str,
+    offset: u64,
+    header_budget: std::time::Duration,
+    chunk_tx: tokio::sync::mpsc::Sender<Result<bytes::Bytes, String>>,
+    cache: Option<&std::path::Path>,
+    edge_cache_path: Option<&Path>,
+) -> Result<Option<u64>, String> {
+    use futures::StreamExt;
+    use tokio::io::AsyncWriteExt;
+
+    let mut cache_file = match cache {
+        Some(path) => Some(
+            tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .await
+                .map_err(|e| format!("open cache {path:?}: {e}"))?,
+        ),
+        None => None,
+    };
+
+    let host = url
+        .split("://")
+        .nth(1)
+        .and_then(|rest| rest.split('/').next())
+        .unwrap_or("")
+        .to_string();
+
+    async fn forward(
+        cache_file: &mut Option<tokio::fs::File>,
+        start: &mut u64,
+        chunk_tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, String>>,
+        chunk: bytes::Bytes,
+    ) -> Result<(), ()> {
+        if let Some(file) = cache_file {
+            file.write_all(&chunk).await.map_err(|_| ())?;
+        }
+        *start += chunk.len() as u64;
+        chunk_tx.send(Ok(chunk)).await.map_err(|_| ())
+    }
+
+    let mut start = offset;
+    if host.is_empty() {
+        // No edge mirror to fall back to: a single direct fetch, streamed
+        // straight through. (This previously sat in a `loop` whose body
+        // returned unconditionally, so it never actually iterated.)
+        let client = build_client(sources);
+        let req = if start > 0 {
+            client.get(url).header(reqwest::header::RANGE, format!("bytes={start}-"))
+        } else {
+            client.get(url)
+        };
+        let resp = req.send().await.map_err(|e| format!("GET {url}: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("GET {url}: HTTP {}", resp.status()));
+        }
+        let total = content_length(&resp);
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| format!("read {url}: {e}"))?;
+            if forward(&mut cache_file, &mut start, &chunk_tx, chunk).await.is_err() {
+                return Ok(total);
+            }
+        }
+        return Ok(total);
+    }
+
+    let ips = resolve_ipv4_candidates(&host, edge_cache_path);
+    tracing::debug!("stream_resilient {host} -> {} candidates", ips.len());
+    if ips.is_empty() {
+        return Err(format!("no candidates for {host}"));
+    }
+    let clients: Vec<(reqwest::Client, std::net::IpAddr)> = ips
+        .into_iter()
+        .map(|ip| {
+            (
+                client_for_edge(&host, ip, std::time::Duration::from_secs(1800)),
+                ip,
+            )
+        })
+        .collect();
+
+    let mut last_err: Option<String> = None;
+    for (client, ip) in &clients {
+        let req = if start > 0 {
+            client.get(url).header(reqwest::header::RANGE, format!("bytes={start}-"))
+        } else {
+            client.get(url)
+        };
+        let resp = match tokio::time::timeout(header_budget, req.send()).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                last_err = Some(format!("GET {url}: {e}"));
+                continue;
+            }
+            Err(_) => {
+                last_err = Some(format!("GET {url}: header timeout"));
+                continue;
+            }
+        };
+        if !resp.status().is_success() {
+            last_err = Some(format!("GET {url}: HTTP {}", resp.status()));
+            continue;
+        }
+        // If we asked for a resume range we must get a 206, otherwise the
+        // bytes would be a duplicate of what was already delivered.
+        if start > 0 && resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+            last_err = Some(format!("GET {url}: resume ignored (HTTP {})", resp.status()));
+            continue;
+        }
+        let total = content_length(&resp);
+        let mut stream = resp.bytes_stream();
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(180), stream.next()).await {
+                Ok(Some(Ok(chunk))) => {
+                    if forward(&mut cache_file, &mut start, &chunk_tx, chunk).await.is_err() {
+                        return Ok(total);
+                    }
+                }
+                Ok(Some(Err(e))) => {
+                    last_err = Some(format!("read {url}: {e}"));
+                    break;
+                }
+                Ok(None) => {
+                    remember_edge(edge_cache_path, &host, *ip);
+                    return Ok(total);
+                }
+                Err(_) => {
+                    last_err = Some(format!("read {url}: stalled mid-body"));
+                    break;
+                }
+            }
+        }
+        tracing::debug!("stream_resilient edge {start} failed: {:?}", last_err);
+    }
+    Err(last_err.unwrap_or_else(|| format!("no candidates for {host}")))
+}
+
+fn content_length(resp: &reqwest::Response) -> Option<u64> {
+    if let Some(cr) = resp.headers().get(reqwest::header::CONTENT_RANGE) {
+        if let Ok(s) = cr.to_str() {
+            if let Some(total) = s.rsplit('/').next() {
+                if let Ok(n) = total.trim().parse::<u64>() {
+                    return Some(n);
+                }
+            }
+        }
+    }
+    resp.content_length()
+}
+
 fn parse_packages_gz(data: &[u8]) -> Result<Vec<HashMap<String, String>>, std::io::Error> {
     let mut text = String::new();
     GzDecoder::new(data).read_to_string(&mut text)?;
@@ -558,6 +880,7 @@ struct WuRow {
     guid: String,
     uid_info: String,
     arch: String,
+    size: u64,
 }
 
 /// Syncs one KB from the Microsoft Update Catalog: searches, picks the best
@@ -575,7 +898,7 @@ async fn wu_sync_kb(
         .collect();
     rows.sort_by(|a, b| wu_score(b).cmp(&wu_score(a)));
     for row in rows {
-        if let Some(url) = wu_download_url(client, base, &row.guid, &row.uid_info).await {
+        if let Some(url) = wu_download_url(client, base, &row.guid, &row.uid_info, row.size).await {
             tracing::info!(
                 "windows catalog: {kb} ({}) -> {}",
                 row.title,
@@ -614,36 +937,46 @@ async fn wu_search(client: &reqwest::Client, base: &str, kb: &str) -> Result<Vec
     Ok(parse_wu_rows(&String::from_utf8_lossy(&body)))
 }
 
-/// Parses the HTML table of the catalog search results page. Each row has a
-/// "Download" button whose onclick calls `goToDownload('1','<guid>','<uid>')`.
+/// Parses the HTML table of the catalog search results page. Each result row
+/// is keyed by `<tr id="<guid>_R<n>">` and its Download button is an input
+/// with `id="<guid>"`; title/date/size live in `_C1_R<n>`, `_C4_R<n>`, and the
+/// `_originalSize` span.
 fn parse_wu_rows(html: &str) -> Vec<WuRow> {
-    let re_download =
-        regex::Regex::new(r#"goToDownload\('1','([^']+)','([^']*)'\)"#).unwrap();
+    let re_tr = regex::Regex::new(r#"^\s*id="([0-9a-f-]{36})_R\d+"[^>]*>"#).unwrap();
     let re_kb = regex::Regex::new(r"(?i)\bKB\d+\b").unwrap();
     let re_title =
-        regex::Regex::new(r#"class="titleColumn"><a[^>]*>(?s)([^<]+)</a>"#).unwrap();
-    let re_date = regex::Regex::new(r"\b\d{1,2}/\d{1,2}/\d{4}\b").unwrap();
+        regex::Regex::new(r#"id="([0-9a-f-]{36})_C1_R\d+"[^>]*>(?s)(.*?)</td>"#).unwrap();
+    let re_date =
+        regex::Regex::new(r#"id="([0-9a-f-]{36})_C4_R\d+"[^>]*>\s*([^<]+)\s*</td>"#).unwrap();
+    let re_size =
+        regex::Regex::new(r#"id="([0-9a-f-]{36})_originalSize">([0-9]+)"#).unwrap();
 
     let mut rows = Vec::new();
-    for chunk in html.split("<tr") {
-        let Some(cap) = re_download.captures(chunk) else {
+    let mut seen = std::collections::HashSet::new();
+    for chunk in html.split("<tr").skip(1) {
+        let Some(cap) = re_tr.captures(chunk) else {
             continue;
         };
         let guid = cap[1].to_string();
-        let uid_info = cap[2].to_string();
-        let kb = re_kb
-            .find(chunk)
-            .map(|m| m.as_str().to_uppercase())
-            .unwrap_or_default();
+        if !seen.insert(guid.clone()) {
+            continue;
+        }
         let title = re_title
             .captures(chunk)
-            .map(|c| c[1].trim().to_string())
+            .map(|c| clean_wu_title(&c[2]))
+            .unwrap_or_default();
+        let kb = re_kb
+            .find(&title)
+            .map(|m| m.as_str().to_uppercase())
             .unwrap_or_default();
         let date = re_date
-            .find_iter(chunk)
-            .last()
-            .map(|m| m.as_str().to_string())
+            .captures(chunk)
+            .map(|c| normalize_wu_date(c[2].trim()))
             .unwrap_or_default();
+        let size = re_size
+            .captures(chunk)
+            .and_then(|c| c[2].parse().ok())
+            .unwrap_or(0);
         let arch = if title.to_lowercase().contains("arm64") {
             "arm64".to_string()
         } else if title.to_lowercase().contains("x86") || title.to_lowercase().contains("32-bit") {
@@ -659,13 +992,20 @@ fn parse_wu_rows(html: &str) -> Vec<WuRow> {
         rows.push(WuRow {
             kb,
             title,
-            date: normalize_wu_date(&date),
-            guid,
-            uid_info,
+            date,
+            guid: guid.clone(),
+            uid_info: guid,
             arch,
+            size,
         });
     }
     rows
+}
+
+/// Strips tags/whitespace from a title cell, keeping the anchor text.
+fn clean_wu_title(cell: &str) -> String {
+    let re_tag = regex::Regex::new(r"(?s)<[^>]*>").unwrap();
+    re_tag.replace_all(cell, " ").to_string().split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Normalizes "6/11/2024" to "2024-06-11".
@@ -714,9 +1054,10 @@ async fn wu_download_url(
     base: &str,
     guid: &str,
     uid_info: &str,
+    size: u64,
 ) -> Option<String> {
     let body = format!(
-        r#"updateIDs=[{{"size":0,"languages":"","uidInfo":"{uid_info}","updateID":"{guid}"}}]"#
+        r#"updateIDs=[{{"size":{size},"languages":"","uidInfo":"{uid_info}","updateID":"{guid}"}}]"#
     );
     let url = format!("{base}/DownloadDialog.aspx");
     let resp = client
@@ -738,31 +1079,39 @@ mod tests {
     #[test]
     fn parses_catalog_search_rows() {
         let html = r##"
-<html><body>
-<table class="results">
-<tr>
-  <td><input type="checkbox" id="checkbox_a1c1095d-4024-4505-b500-10e48460b99c" /></td>
-  <td class="idColumn"><a href="/Search.aspx?q=KB5039227">KB5039227</a></td>
-  <td class="titleColumn"><a href="/Search.aspx?q=KB5039227">2024-06 Cumulative Update for Microsoft server operating system version 21H2 for x64-based Systems (KB5039227)</a></td>
-  <td class="resultsRightColumn">Chinese (Simplified), English</td>
-  <td class="resultsRightColumn">~ 207.6 MB</td>
-  <td class="resultsRightColumn">6/11/2024</td>
-  <td class="resultsRightColumn"><a class="tableButton" href="#" onclick="goToDownload('1','a1c1095d-4024-4505-b500-10e48460b99c','a1c1095d-4024-4505-b500-10e48460b99c');return false;">Download</a></td>
+<table id="ctl00_catalogBody_updateResults">
+<tr id="a1c1095d-4024-4505-b500-10e48460b99c_R0" style="border-width:0px;">
+	<td class="resultsbottomBorder resultspadding resultsIconWidth " id="a1c1095d-4024-4505-b500-10e48460b99c_C0_R0"></td>
+	<td class="resultsbottomBorder resultspadding" id="a1c1095d-4024-4505-b500-10e48460b99c_C1_R0">
+		<a id='a1c1095d-4024-4505-b500-10e48460b99c_link' href= "javascript:void(0);" onclick='goToDetails("a1c1095d-4024-4505-b500-10e48460b99c");' class="contentTextItemSpacerNoBreakLink">
+			2024-06 Cumulative Update for Microsoft server operating system version 21H2 for x64-based Systems (KB5039227)
+		</a>
+	</td>
+	<td class="resultsbottomBorder resultspadding" id="a1c1095d-4024-4505-b500-10e48460b99c_C4_R0">6/11/2024</td>
+	<td class="resultsbottomBorder resultspadding resultsSizeWidth" id="a1c1095d-4024-4505-b500-10e48460b99c_C6_R0">
+	   <span id="a1c1095d-4024-4505-b500-10e48460b99c_size">207.6 MB</span>
+	   <span class="noDisplay" id="a1c1095d-4024-4505-b500-10e48460b99c_originalSize">217703505</span>
+	</td>
+	<td class="resultsbottomBorder resultsButtonWidth" id="a1c1095d-4024-4505-b500-10e48460b99c_C7_R0">
+		<input id="a1c1095d-4024-4505-b500-10e48460b99c" class="flatBlueButtonDownload focus-only" type="button" value='Download' />
+	</td>
 </tr>
-<tr>
-  <td><input type="checkbox" id="checkbox_11111111-2222-3333-4444-555555555555" /></td>
-  <td class="idColumn"><a href="/Search.aspx?q=KB5039227">KB5039227</a></td>
-  <td class="titleColumn"><a href="/Search.aspx?q=KB5039227">2024-06 Cumulative Update for Microsoft server operating system version 21H2 for ARM64-based Systems (KB5039227)</a></td>
-  <td class="resultsRightColumn">English</td>
-  <td class="resultsRightColumn">~ 150.1 MB</td>
-  <td class="resultsRightColumn">6/11/2024</td>
-  <td class="resultsRightColumn"><a class="tableButton" href="#" onclick="goToDownload('1','11111111-2222-3333-4444-555555555555','11111111-2222-3333-4444-555555555555');return false;">Download</a></td>
-</tr>
-<tr>
-  <td class="resultsRightColumn" colspan="7">no goToDownload in this row</td>
+<tr id="11111111-2222-3333-4444-555555555555_R1" style="border-width:0px;">
+	<td class="resultsbottomBorder resultspadding resultsIconWidth " id="11111111-2222-3333-4444-555555555555_C0_R1"></td>
+	<td class="resultsbottomBorder resultspadding" id="11111111-2222-3333-4444-555555555555_C1_R1">
+		<a id='11111111-2222-3333-4444-555555555555_link' href= "javascript:void(0);" onclick='goToDetails("11111111-2222-3333-4444-555555555555");' class="contentTextItemSpacerNoBreakLink">
+			2024-06 Cumulative Update for Microsoft server operating system version 21H2 for ARM64-based Systems (KB5039227)
+		</a>
+	</td>
+	<td class="resultsbottomBorder resultspadding" id="11111111-2222-3333-4444-555555555555_C4_R1">6/11/2024</td>
+	<td class="resultsbottomBorder resultspadding resultsSizeWidth" id="11111111-2222-3333-4444-555555555555_C6_R1">
+	   <span class="noDisplay" id="11111111-2222-3333-4444-555555555555_originalSize">157348048</span>
+	</td>
+	<td class="resultsbottomBorder resultsButtonWidth" id="11111111-2222-3333-4444-555555555555_C7_R1">
+		<input id="11111111-2222-3333-4444-555555555555" class="flatBlueButtonDownload focus-only" type="button" value='Download' />
+	</td>
 </tr>
 </table>
-</body></html>
 "##;
         let rows = parse_wu_rows(html);
         assert_eq!(rows.len(), 2, "two result rows with download buttons");
@@ -771,6 +1120,7 @@ mod tests {
         assert_eq!(x64.date, "2024-06-11");
         assert_eq!(x64.guid, "a1c1095d-4024-4505-b500-10e48460b99c");
         assert!(x64.title.contains("x64-based"));
+        assert_eq!(x64.size, 217_703_505);
         let arm = rows.iter().find(|r| r.arch == "arm64").unwrap();
         assert_eq!(arm.guid, "11111111-2222-3333-4444-555555555555");
         assert!(wu_score(x64) > wu_score(arm), "x64/server rows rank first");

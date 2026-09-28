@@ -292,10 +292,7 @@ pub async fn provision_host(
         .read_ca_pem()
         .await
         .ok_or_else(|| "server CA not found (provisioned at first boot)".to_string())?;
-    let token = store
-        .enrollment_token()
-        .await
-        .ok_or_else(|| "no enrollment token configured".to_string())?;
+    let token = store.enrollment_token().await?;
     if !token
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')

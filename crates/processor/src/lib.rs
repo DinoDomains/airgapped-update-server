@@ -194,19 +194,34 @@ impl Processor {
     }
 
     /// Step 2: given DevNet inventory + vendor catalog, compute what is
-    /// needed. Only packages the machine has installed are candidates.
+    /// needed. Installed packages that have a catalog entry are candidates;
+    /// Windows devices additionally pull catalog entries for their
+    /// family/arch that aren't yet installed (cumulative KBs supersede
+    /// earlier ones, so a new KB is a valid update target).
     pub fn compute_required(
         &self,
         inventory: &OutboundInventory,
         catalog: &VendorCatalog,
     ) -> Vec<(String, String, VendorEntry)> {
-        // Package name -> device id (first matching device wins; the queue is
-        // package-scoped for M7, per-plan).
         let mut required: Vec<(String, String, VendorEntry)> = Vec::new();
         for device in &inventory.devices {
-            for pkg in &device.packages {
-                if let Some(entry) = catalog.packages.get(&pkg.name.to_lowercase()) {
+            let installed: Vec<String> = device
+                .packages
+                .iter()
+                .map(|p| p.name.to_lowercase())
+                .collect();
+            for (key, entry) in &catalog.packages {
+                let name = key.clone();
+                let matches_family = device.distro_family.to_lowercase() == entry.family.to_lowercase();
+                if installed.contains(key) {
+                    let pkg = device
+                        .packages
+                        .iter()
+                        .find(|p| p.name.to_lowercase() == name)
+                        .unwrap();
                     required.push((pkg.name.clone(), device.device_id.clone(), entry.clone()));
+                } else if matches_family && entry.family.eq_ignore_ascii_case("windows") {
+                    required.push((name, device.device_id.clone(), entry.clone()));
                 }
             }
         }

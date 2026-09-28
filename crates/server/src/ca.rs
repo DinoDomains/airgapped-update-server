@@ -1,5 +1,4 @@
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -49,8 +48,14 @@ fn rebuild_issuer(
 }
 
 impl Ca {
+    /// Loads the CA from `dir`, creating it if absent.
+    ///
+    /// `dir` is expected to be the out-of-store key directory (see
+    /// `fsguard::key_dir`). Public material (`ca.pem`, `server.pem`) is
+    /// copied into the store's `ca/` directory so it can be served to
+    /// agents; private keys stay in the key directory at `0600`.
     pub fn load_or_create(dir: &Path) -> Result<Self, Box<dyn std::error::Error>> {
-        fs::create_dir_all(dir)?;
+        crate::fsguard::ensure_dir(dir, crate::fsguard::DIR_MODE)?;
         let ca_pem_path = dir.join("ca.pem");
         let ca_key_path = dir.join("ca-key.pem");
         let srv_pem_path = dir.join("server.pem");
@@ -75,8 +80,9 @@ impl Ca {
             ];
             let cert = params.self_signed(&key)?;
             fs::write(&ca_pem_path, cert.pem())?;
-            fs::write(&ca_key_path, key.serialize_pem())?;
-            fs::set_permissions(&ca_key_path, fs::Permissions::from_mode(0o600))?;
+            // Private key: written via the guarded helper so it is 0600 even
+            // if the process umask is permissive.
+            crate::fsguard::write_secret(&ca_key_path, key.serialize_pem().as_bytes())?;
             let der = cert.der().clone();
             (cert, key, der)
         };
@@ -89,10 +95,14 @@ impl Ca {
         } else {
             let (server_cert, server_key) = Self::generate_server(&issuer, &ca_key)?;
             fs::write(&srv_pem_path, server_cert.pem())?;
-            fs::write(&srv_key_path, server_key.serialize_pem())?;
-            fs::set_permissions(&srv_key_path, fs::Permissions::from_mode(0o600))?;
+            crate::fsguard::write_secret(&srv_key_path, server_key.serialize_pem().as_bytes())?;
             (server_cert.der().clone(), to_pkcs8_der(&server_key))
         };
+
+        // Defensive: tighten any key file that predates this change.
+        for key in [&ca_key_path, &srv_key_path] {
+            let _ = crate::fsguard::tighten(key, crate::fsguard::KEY_MODE, false);
+        }
 
         let next_serial = fs::read_to_string(&serial_path)
             .ok()
@@ -114,12 +124,21 @@ impl Ca {
         issuer_key: &KeyPair,
     ) -> Result<(Certificate, KeyPair), rcgen::Error> {
         let key = KeyPair::generate()?;
-        let mut params = CertificateParams::new(vec![
+        let mut sans: Vec<String> = vec![
             "airgap-server.internal".to_string(),
             "172.16.5.20".to_string(),
             "172.16.237.133".to_string(),
             "127.0.0.1".to_string(),
-        ])?;
+        ];
+        if let Ok(extra) = std::env::var("AIRGAP_SERVER_SANS") {
+            for s in extra.split(',') {
+                let s = s.trim();
+                if !s.is_empty() && !sans.iter().any(|x| x == s) {
+                    sans.push(s.to_string());
+                }
+            }
+        }
+        let mut params = CertificateParams::new(sans)?;
         let mut dn = DistinguishedName::new();
         dn.push(DnType::CommonName, "airgap-server");
         params.distinguished_name = dn;
@@ -142,9 +161,14 @@ impl Ca {
         params.serial_number = Some(self.next_serial.into());
         let cert = params.signed_by(&key, &self.issuer, &self.ca_key)?;
         self.next_serial += 1;
-        fs::create_dir_all(dir)?;
+        crate::fsguard::ensure_dir(dir, crate::fsguard::DIR_MODE)?;
+        // The agent private key is served back to the enrolling agent over
+        // TLS and persisted server-side; keep it owner-only.
         fs::write(dir.join(format!("{agent_id}.pem")), cert.pem()).ok();
-        fs::write(dir.join(format!("{agent_id}-key.pem")), key.serialize_pem()).ok();
+        crate::fsguard::write_secret(
+            &dir.join(format!("{agent_id}-key.pem")),
+            key.serialize_pem().as_bytes(),
+        )?;
         Ok((cert, key))
     }
 

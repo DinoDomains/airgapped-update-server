@@ -209,8 +209,10 @@ as pretty-printed JSON in `<store>/`:
   last_seen, status).
 - `reports.json` — list of install reports.
 - `catalog.json` — the current update list.
-- `tokens.json` — valid enrollment tokens. Seeded with the value of
-  `AIRGAP_ENROLL_TOKEN` (default `airgap-bootstrap`) on first boot.
+- `tokens.json` — enrollment tokens, stored as `sha256:<hex>` digests. Raw
+  tokens are never persisted. Seeded from `AIRGAP_ENROLL_TOKEN` (default
+  `airgap-bootstrap`) on first boot; existing plaintext entries are re-hashed
+  automatically on load. See `docs/SECURITY.md`.
 
 Key methods: `check_token`, `register_agent`, `update_inventory`,
 `record_report`, `pending_updates`.

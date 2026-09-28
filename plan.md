@@ -126,7 +126,8 @@ reuse the modules. Modules:
 - `AgentRecord { agent_id, hostname, inventory, last_seen, status, ip }`.
 - `UpdateRequest { id, agent_id, package, from_version, to_version, ring,
   ts, status }` — "approved-pending" approvals.
-- Seed token from `AIRGAP_ENROLL_TOKEN` (default `airgap-bootstrap`).
+- Seed token from `AIRGAP_ENROLL_TOKEN` (default `airgap-bootstrap`), stored
+  as a `sha256:` digest; the raw value is never written to disk.
 
 ### api.rs — mTLS endpoints (:8443)
 - `POST /enroll` (token) → issues cert, returns cert+key+CA.

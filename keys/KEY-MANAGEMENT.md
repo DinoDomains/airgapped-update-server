@@ -27,6 +27,53 @@ them. See PLAN.md §5.5.
   - backup of the key dir is itself encrypted and offline;
   - documented migration to HSM is a planned hardening step.
 
+### Server key directory (`AIRGAP_KEY_DIR`)
+
+The Update Server keeps its private key material **outside** the store
+directory. The store is the web-facing path; anything that can walk the store
+tree must not be able to walk into a signing key.
+
+Resolution order:
+
+1. `$AIRGAP_KEY_DIR`, if set;
+2. otherwise a **sibling** of the store dir — `<store>-keys`. A sibling, not
+   a child, so a traversal rooted at the store cannot reach it.
+
+```sh
+AIRGAP_STORE_DIR=/var/lib/airgap-server/data
+# -> keys land in /var/lib/airgap-server/data-keys
+```
+
+What lives where:
+
+| path | mode | contents |
+|---|---|---|
+| `<key-dir>/ca-key.pem` | 0600 | CA private key |
+| `<key-dir>/server-key.pem` | 0600 | mTLS server private key |
+| `<key-dir>/keys/*-signing-key` | 0600 | DevNet / release signing private keys |
+| `<key-dir>/certs/*-key.pem` | 0600 | per-agent mTLS private keys |
+| `<key-dir>/ca.pem`, `server.pem` | 0644 | public certificates |
+| `<store>/ca/ca.pem`, `server.pem` | 0644 | public mirror, for agent provisioning |
+| `<store>/keys/*-verifying-key.pub` | 0644 | public signing keys |
+
+Public material is mirrored into the store so the dashboard and provisioning
+flow can read it without access to the key directory. It is not secret.
+
+Every private key the server writes — CA, server, signing, and per-agent mTLS
+— lives under the key directory. On first startup after upgrading, the server
+relocates any that are still under the store:
+
+- `<store>/ca/{ca,server}-key.pem` → `<key-dir>/`
+- `<store>/keys/*-signing-key` → `<key-dir>/keys/`
+- `<store>/certs/*-key.pem` → `<key-dir>/certs/`
+
+If the destination already holds *different* key material, neither copy is
+touched and the server logs a warning — resolve that by hand rather than
+letting it be overwritten.
+
+`data/` is gitignored; confirm with `git ls-files data/` (expect no output)
+before you ever place a key there.
+
 ## Provisioning (first use)
 
 1. On DevNet core VM: `airgap-keys provision export` -> writes

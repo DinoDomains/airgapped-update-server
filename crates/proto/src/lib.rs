@@ -89,6 +89,8 @@ pub struct PollResponse {
     pub updates: Vec<UpdateItem>,
     #[serde(default)]
     pub scan_requested: bool,
+    #[serde(default)]
+    pub revert_commands: Vec<RevertCommand>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,4 +120,33 @@ pub struct ArtifactRequest {
     pub agent_id: String,
     pub update_id: String,
     pub family: String,
+}
+
+/// M6 protocol extension: admin-initiated revert command received over mTLS.
+/// Extends the existing protocol without a parallel connection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevertCommand {
+    pub agent_id: String,
+    pub command_id: String,
+    pub package: String,
+    pub target_version: String,
+}
+
+/// M6 protocol extension: revert outcome reported back to the server.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RevertOutcome {
+    Success,
+    Failed { reason: String },
+    NotRevertible { reason: String },
+}
+
+/// The revert report message sent from agent to server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevertReport {
+    pub agent_id: String,
+    pub command_id: String,
+    pub package: String,
+    pub target_version: String,
+    pub outcome: RevertOutcome,
+    pub executed_at: String,
 }

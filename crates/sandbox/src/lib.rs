@@ -237,9 +237,26 @@ pub fn extract_and_analyze(
     analyze_extracted(&extract_dir, pkg_type)
 }
 
+/// Cross-platform executability check. On Unix uses the mode bits; on
+/// Windows falls back to common executable extensions since the mode bits
+/// don't exist.
+fn is_executable_file(metadata: &std::fs::Metadata, path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        matches!(
+            path.extension().and_then(|s| s.to_str()).map(|s| s.to_ascii_lowercase()).as_deref(),
+            Some("exe" | "msi" | "bat" | "cmd" | "com" | "ps1" | "scr")
+        )
+    }
+}
+
 fn analyze_extracted(extract_dir: &Path, pkg_type: PackageType) -> Result<ExtractedPackage, SandboxError> {
     use sha2::{Digest, Sha256};
-    use std::os::unix::fs::PermissionsExt;
 
     let mut files = Vec::new();
     let mut total_size = 0u64;
@@ -251,7 +268,7 @@ fn analyze_extracted(extract_dir: &Path, pkg_type: PackageType) -> Result<Extrac
             let metadata = entry.metadata().map_err(|e| SandboxError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
             let size = metadata.len();
             total_size += size;
-            let is_executable = metadata.permissions().mode() & 0o111 != 0;
+            let is_executable = is_executable_file(&metadata, path);
 
             let mut hasher = Sha256::new();
             std::io::copy(&mut std::fs::File::open(path)?, &mut hasher)?;
