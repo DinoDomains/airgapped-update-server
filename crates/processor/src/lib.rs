@@ -369,11 +369,11 @@ impl Processor {
             revocations: revocations.to_vec(),
         };
 
-        let attestation = DriveAttestation {
-            drive_id: self.inbound_drive_id.clone(),
-            direction: Direction::Inbound,
+        let attestation = DriveAttestation::new(
+            self.inbound_drive_id.clone(),
+            Direction::Inbound,
             session,
-        };
+        );
 
         let bundle = InboundBundle::build_from(&catalog, &attestation, &stage)?;
 
@@ -522,11 +522,7 @@ mod tests {
             }],
         });
         let out = OutboundBundle {
-            attestation: DriveAttestation {
-                drive_id: "USB-OUT-01".into(),
-                direction: Direction::Outbound,
-                session: 7,
-            },
+            attestation: DriveAttestation::new("USB-OUT-01", Direction::Outbound, 7),
             inventory: inv,
         };
         out.write(&outbound_drive, &devnet_keys.load_signing_key(KeyRole::Export).unwrap())
@@ -649,11 +645,7 @@ mod tests {
         let outbound_drive = root.join("outbound-usb");
         fs::create_dir_all(&outbound_drive).unwrap();
         let out = OutboundBundle {
-            attestation: DriveAttestation {
-                drive_id: "USB-OUT-01".into(),
-                direction: Direction::Outbound,
-                session: 7,
-            },
+            attestation: DriveAttestation::new("USB-OUT-01", Direction::Outbound, 7),
             inventory: OutboundInventory::new("devnet-1"),
         };
         out.write(&outbound_drive, &devnet_keys.load_signing_key(KeyRole::Export).unwrap())

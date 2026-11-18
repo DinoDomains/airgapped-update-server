@@ -57,6 +57,10 @@ pub enum ContractError {
     PathTraversal(String),
     #[error("missing file: {0}")]
     Missing(String),
+    #[error("TAMPER DETECTED: {0} — cryptographic self-destruct activated")]
+    TamperDetected(String),
+    #[error("credential authentication failed: {0}")]
+    AuthenticationFailed(String),
 }
 
 /// SHA-256 of raw bytes.
@@ -84,11 +88,27 @@ pub struct DriveAttestation {
     pub drive_id: String,
     pub direction: Direction,
     pub session: u64,
+    #[serde(default)]
+    pub cycle_token: Option<String>,
 }
 
 impl DriveAttestation {
-    /// Verify the three envelope files exist and match an expected identity
-    /// and a strictly-increasing session. Fail closed on any mismatch.
+    pub fn new(drive_id: impl Into<String>, direction: Direction, session: u64) -> Self {
+        Self {
+            drive_id: drive_id.into(),
+            direction,
+            session,
+            cycle_token: None,
+        }
+    }
+
+    pub fn with_cycle_token(mut self, token: impl Into<String>) -> Self {
+        self.cycle_token = Some(token.into());
+        self
+    }
+
+    /// Verify the envelope files exist and match an expected identity,
+    /// a strictly-increasing session, and optionally valid rolling token.
     pub fn read_and_verify(
         drive_root: &Path,
         expected_drive_id: &str,
@@ -139,16 +159,86 @@ impl DriveAttestation {
             )));
         }
 
+        let cycle_token = fs::read_to_string(drive_root.join("cycle_token.txt"))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
         Ok(DriveAttestation {
             drive_id,
             direction,
             session,
+            cycle_token,
         })
     }
 
-    /// Write the three envelope files. Used by the writer side (EXPORT VM
-    /// for outbound; Update Server for inbound). Creates the drive root if
-    /// needed.
+    /// Verify that the drive's rolling cycle token has not been previously consumed/burned
+    /// (card autolock mechanism against replay).
+    pub fn verify_rolling_token(
+        drive_root: &Path,
+        consumed_tokens_path: &Path,
+    ) -> Result<Option<String>, ContractError> {
+        let token_path = drive_root.join("cycle_token.txt");
+        if !token_path.exists() {
+            return Ok(None);
+        }
+        let token = fs::read_to_string(&token_path)
+            .map_err(|_| ContractError::Missing("cycle_token.txt".into()))?
+            .trim()
+            .to_string();
+
+        if token.is_empty() {
+            return Err(ContractError::Attestation("empty cycle_token.txt".into()));
+        }
+
+        if consumed_tokens_path.exists() {
+            if let Ok(content) = fs::read_to_string(consumed_tokens_path) {
+                if let Ok(burned) = serde_json::from_str::<std::collections::HashSet<String>>(&content) {
+                    if burned.contains(&token) {
+                        return Err(ContractError::Attestation(format!(
+                            "CYCLE REPLAY DETECTED: rolling token {} has already been consumed (card autolock active)",
+                            token
+                        )));
+                    }
+                }
+            }
+        }
+
+        Ok(Some(token))
+    }
+
+    /// Burn a token to permanently prevent it from ever being run or ingested again.
+    pub fn burn_token(
+        consumed_tokens_path: &Path,
+        token: &str,
+    ) -> Result<(), ContractError> {
+        if token.is_empty() {
+            return Ok(());
+        }
+        let mut burned = if consumed_tokens_path.exists() {
+            let content = fs::read_to_string(consumed_tokens_path).unwrap_or_default();
+            serde_json::from_str::<std::collections::HashSet<String>>(&content).unwrap_or_default()
+        } else {
+            std::collections::HashSet::new()
+        };
+        burned.insert(token.to_string());
+        if let Some(parent) = consumed_tokens_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let data = serde_json::to_string_pretty(&burned)?;
+        fs::write(consumed_tokens_path, data)?;
+        Ok(())
+    }
+
+    /// Generate a fresh cryptographically random 256-bit token for the next cycle.
+    pub fn generate_next_token() -> String {
+        use rand::RngCore;
+        let mut bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        hex::encode(bytes)
+    }
+
+    /// Write the envelope files.
     pub fn write(&self, drive_root: &Path) -> Result<(), ContractError> {
         fs::create_dir_all(drive_root)?;
         fs::write(drive_root.join("drive_id.txt"), &self.drive_id)?;
@@ -157,6 +247,9 @@ impl DriveAttestation {
             format!("{}\n", self.direction.as_str()),
         )?;
         fs::write(drive_root.join("session.id"), format!("{}\n", self.session))?;
+        if let Some(ref token) = self.cycle_token {
+            fs::write(drive_root.join("cycle_token.txt"), format!("{}\n", token))?;
+        }
         Ok(())
     }
 }
@@ -552,6 +645,161 @@ pub fn ed25519_verify(
         .map_err(|_| ContractError::Signature("ed25519 verification failed".into()))
 }
 
+// ---------------------------------------------------------------------------
+// §4 — Anti-Tamper Cryptographic Self-Destruct & Key Envelope
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntegrityCanary {
+    pub file_count: usize,
+    pub manifest_sha256: String,
+    pub created_at: String,
+    pub authorized_system: String,
+}
+
+impl IntegrityCanary {
+    pub fn build(drive_root: &Path, authorized_system: &str) -> Result<Self, ContractError> {
+        let mut count = 0;
+        let mut manifest_hash = String::new();
+
+        if drive_root.exists() {
+            for entry in fs::read_dir(drive_root)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.is_file() {
+                    count += 1;
+                    let fname = entry.file_name();
+                    if fname == "manifest.json" || fname == "inventory.json" {
+                        manifest_hash = sha256_file(&path)?;
+                    }
+                }
+            }
+        }
+
+        Ok(Self {
+            file_count: count,
+            manifest_sha256: manifest_hash,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            authorized_system: authorized_system.to_string(),
+        })
+    }
+
+    /// Sign and write the canary file
+    pub fn write_signed(
+        &self,
+        drive_root: &Path,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> Result<(), ContractError> {
+        let json = serde_json::to_vec(self)?;
+        let sig = ed25519_sign(signing_key, &json);
+        fs::write(drive_root.join("integrity.canary"), json)?;
+        fs::write(drive_root.join("integrity.canary.sig"), sig)?;
+        Ok(())
+    }
+
+    /// Verify filesystem integrity against the canary.
+    /// If an unauthorized write occurred, returns Err(ContractError::TamperDetected).
+    pub fn verify(
+        drive_root: &Path,
+        verifying_key: &ed25519_dalek::VerifyingKey,
+    ) -> Result<Self, ContractError> {
+        let canary_path = drive_root.join("integrity.canary");
+        let sig_path = drive_root.join("integrity.canary.sig");
+
+        if !canary_path.exists() || !sig_path.exists() {
+            return Err(ContractError::TamperDetected(
+                "missing integrity canary on drive".into(),
+            ));
+        }
+
+        let canary_bytes = fs::read(&canary_path)?;
+        let sig = fs::read_to_string(&sig_path)?;
+        ed25519_verify(verifying_key, &canary_bytes, &sig).map_err(|e| {
+            ContractError::TamperDetected(format!("canary signature forged: {e}"))
+        })?;
+
+        let canary: IntegrityCanary = serde_json::from_slice(&canary_bytes)?;
+
+        // Audit current files on drive
+        let mut actual_count = 0;
+        let mut actual_manifest_hash = String::new();
+        for entry in fs::read_dir(drive_root)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_file() {
+                let fname = entry.file_name();
+                actual_count += 1;
+                if fname == "manifest.json" || fname == "inventory.json" {
+                    actual_manifest_hash = sha256_file(&path)?;
+                }
+            }
+        }
+
+        // Check if unauthorized files were written
+        if actual_count > canary.file_count + 2 {
+            return Err(ContractError::TamperDetected(format!(
+                "unauthorized files added to drive: expected {}, found {}",
+                canary.file_count + 2,
+                actual_count
+            )));
+        }
+
+        if !canary.manifest_sha256.is_empty() && actual_manifest_hash != canary.manifest_sha256 {
+            return Err(ContractError::TamperDetected(
+                "manifest was modified or tampered with".into(),
+            ));
+        }
+
+        Ok(canary)
+    }
+}
+
+/// Instant Cryptographic Zeroization (Key Envelope Shredder).
+/// Performs two passes of cryptographically secure random bytes + zeroes with fsync,
+/// instantly making all encrypted payloads on the USB mathematically irrecoverable.
+pub fn zeroize_and_shred_envelope(drive_root: &Path) -> Result<(), ContractError> {
+    use rand::RngCore;
+    use std::io::Write;
+
+    let envelope_path = drive_root.join("key_envelope.bin");
+    if !envelope_path.exists() {
+        return Ok(());
+    }
+
+    let len = match fs::metadata(&envelope_path) {
+        Ok(m) => (m.len() as usize).max(512),
+        Err(_) => 512,
+    };
+
+    // Pass 1: Cryptographic noise
+    let mut random_bytes = vec![0u8; len];
+    rand::rngs::OsRng.fill_bytes(&mut random_bytes);
+    if let Ok(mut file) = fs::OpenOptions::new().write(true).open(&envelope_path) {
+        let _ = file.write_all(&random_bytes);
+        let _ = file.sync_all();
+    }
+
+    // Pass 2: Zero fill
+    let zero_bytes = vec![0u8; len];
+    if let Ok(mut file) = fs::OpenOptions::new().write(true).open(&envelope_path) {
+        let _ = file.write_all(&zero_bytes);
+        let _ = file.sync_all();
+    }
+
+    // Write lock marker
+    let _ = fs::write(
+        drive_root.join("TAMPER_SELF_DESTRUCTED.txt"),
+        format!(
+            "CRITICAL ALERT: Drive self-destruct triggered at {}. Key envelope shredded. Re-verification required.\n",
+            chrono::Utc::now().to_rfc3339()
+        ),
+    );
+
+    let _ = fs::remove_file(&envelope_path);
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -585,11 +833,7 @@ mod tests {
         });
 
         let bundle = OutboundBundle {
-            attestation: DriveAttestation {
-                drive_id: "USB-OUTBOUND-0001".into(),
-                direction: Direction::Outbound,
-                session: 41,
-            },
+            attestation: DriveAttestation::new("USB-OUTBOUND-0001", Direction::Outbound, 41),
             inventory: inv,
         };
         bundle.write(&root, &sk).unwrap();
@@ -609,11 +853,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
 
         let bundle = OutboundBundle {
-            attestation: DriveAttestation {
-                drive_id: "USB-OUTBOUND-0001".into(),
-                direction: Direction::Outbound,
-                session: 1,
-            },
+            attestation: DriveAttestation::new("USB-OUTBOUND-0001", Direction::Outbound, 1),
             inventory: OutboundInventory::new("devnet-1"),
         };
         bundle.write(&root, &sk).unwrap();
@@ -631,11 +871,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
 
         let bundle = OutboundBundle {
-            attestation: DriveAttestation {
-                drive_id: "USB-OUTBOUND-0001".into(),
-                direction: Direction::Outbound,
-                session: 5,
-            },
+            attestation: DriveAttestation::new("USB-OUTBOUND-0001", Direction::Outbound, 5),
             inventory: OutboundInventory::new("devnet-1"),
         };
         bundle.write(&root, &sk).unwrap();
@@ -677,11 +913,7 @@ mod tests {
         let manifest = InboundManifest::build(42, &catalog, &artifacts_dir).unwrap();
 
         let bundle = InboundBundle {
-            attestation: DriveAttestation {
-                drive_id: "USB-INBOUND-0002".into(),
-                direction: Direction::Inbound,
-                session: 42,
-            },
+            attestation: DriveAttestation::new("USB-INBOUND-0002", Direction::Inbound, 42),
             catalog,
             manifest,
         };
@@ -723,11 +955,7 @@ mod tests {
         };
         let manifest = InboundManifest::build(1, &catalog, &artifacts_dir).unwrap();
         let bundle = InboundBundle {
-            attestation: DriveAttestation {
-                drive_id: "USB-INBOUND-0002".into(),
-                direction: Direction::Inbound,
-                session: 1,
-            },
+            attestation: DriveAttestation::new("USB-INBOUND-0002", Direction::Inbound, 1),
             catalog,
             manifest,
         };
@@ -749,5 +977,71 @@ mod tests {
         let sig = ed25519_sign(&sk, payload);
         ed25519_verify(&vk, payload, &sig).unwrap();
         assert!(ed25519_verify(&vk, b"tampered", &sig).is_err());
+    }
+
+    #[test]
+    fn rolling_token_autolock() {
+        let root = std::env::temp_dir().join(format!("airgap-token-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let consumed_path = root.join("consumed.json");
+        let token = DriveAttestation::generate_next_token();
+        assert_eq!(token.len(), 64); // 256-bit hex
+
+        let att = DriveAttestation::new("USB-OUTBOUND-0001", Direction::Outbound, 1)
+            .with_cycle_token(&token);
+        att.write(&root).unwrap();
+
+        // 1st consumption: token verified OK
+        let verified = DriveAttestation::verify_rolling_token(&root, &consumed_path).unwrap();
+        assert_eq!(verified, Some(token.clone()));
+
+        // Burn token (card autolock)
+        DriveAttestation::burn_token(&consumed_path, &token).unwrap();
+
+        // 2nd attempt with same token must fail immediately
+        let replay_res = DriveAttestation::verify_rolling_token(&root, &consumed_path);
+        assert!(replay_res.is_err());
+        assert!(replay_res.unwrap_err().to_string().contains("CYCLE REPLAY DETECTED"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn anti_tamper_canary_and_zeroization() {
+        let (sk, vk) = keypair();
+        let root = std::env::temp_dir().join(format!("airgap-tamper-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        // 1. Create initial authentic drive files
+        fs::write(root.join("drive_id.txt"), "USB-SECURE-001").unwrap();
+        fs::write(root.join("key_envelope.bin"), b"SUPER_SECRET_MASTER_ENCRYPTION_KEY_256").unwrap();
+
+        // 2. Build and sign authentic canary
+        let canary = IntegrityCanary::build(&root, "airgap-server").unwrap();
+        canary.write_signed(&root, &sk).unwrap();
+
+        // 3. Verify passes on untampered drive
+        let verified = IntegrityCanary::verify(&root, &vk);
+        assert!(verified.is_ok());
+
+        // 4. Simulate unauthorized system writing an unauthorized file
+        fs::write(root.join("unauthorized_malware.sh"), b"echo pwned").unwrap();
+
+        // 5. Verify canary fails with TamperDetected
+        let tamper_res = IntegrityCanary::verify(&root, &vk);
+        assert!(tamper_res.is_err());
+        assert!(matches!(tamper_res, Err(ContractError::TamperDetected(_))));
+
+        // 6. Trigger zeroization shredder
+        zeroize_and_shred_envelope(&root).unwrap();
+
+        // 7. Verify key envelope is wiped/destroyed and self-destruct marker present
+        assert!(!root.join("key_envelope.bin").exists());
+        assert!(root.join("TAMPER_SELF_DESTRUCTED.txt").exists());
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

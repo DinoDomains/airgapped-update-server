@@ -1,0 +1,17 @@
+# Toolchain workaround (not a project requirement).
+#
+# The rustc in this environment (1.97.x) defaults to the bundled `rust-lld`,
+# which segfaults when linking the large `airgap-server` test binary on this
+# host. Pin the GNU system linker for native Linux builds.
+#
+# Override per-invocation without editing this file:
+#   CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=bfd" cargo test
+#
+# Remove this section once rust-lld is fixed in the active toolchain.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=bfd"]
+
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+ar = "x86_64-w64-mingw32-ar"
+runner = "x86_64-w64-mingw32-wine64"

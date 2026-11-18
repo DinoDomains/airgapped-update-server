@@ -17,8 +17,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use airgap_contracts::{
-    DeviceInventory, DriveAttestation, Direction, InstalledPackage, OutboundBundle,
-    OutboundInventory,
+    DeviceInventory, DriveAttestation, Direction, InstalledPackage, IntegrityCanary,
+    OutboundBundle, OutboundInventory, zeroize_and_shred_envelope,
 };
 use airgap_keys::{KeyManager, KeyRole};
 use axum::extract::State;
@@ -112,6 +112,12 @@ pub struct EndpointInfo {
     pub family: String,
     pub arch: String,
     pub packages: Vec<EndpointPackage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_updated_at: Option<String>,
+    #[serde(default)]
+    pub disks: Vec<airgap_proto::DiskStorage>,
+    #[serde(default)]
+    pub networks: Vec<airgap_proto::NetworkInterface>,
 }
 
 /// Aggregate state returned by `GET /api/state`.
@@ -261,10 +267,19 @@ pub async fn state_api(
     let mut endpoints: Vec<EndpointInfo> = Vec::new();
     for agent in &agents {
         let inv = agent.inventory.as_ref();
+        let ip = agent.ip.clone().or_else(|| {
+            inv.and_then(|i| {
+                i.networks.iter()
+                    .flat_map(|n| n.ip_addresses.iter())
+                    .find(|ip| !ip.starts_with("127."))
+                    .cloned()
+            })
+        });
+
         endpoints.push(EndpointInfo {
             agent_id: agent.agent_id.clone(),
             hostname: agent.hostname.clone(),
-            ip: agent.ip.clone(),
+            ip,
             last_seen: agent.last_seen.clone(),
             status: agent.status.clone(),
             os_name: inv.map(|i| i.os_name.clone()).unwrap_or_default(),
@@ -285,6 +300,9 @@ pub async fn state_api(
                         .collect()
                 })
                 .unwrap_or_default(),
+            last_updated_at: inv.and_then(|i| i.last_updated_at.clone()),
+            disks: inv.map(|i| i.disks.clone()).unwrap_or_default(),
+            networks: inv.map(|i| i.networks.clone()).unwrap_or_default(),
         });
     }
     endpoints.sort_by(|a, b| a.hostname.cmp(&b.hostname));
@@ -540,11 +558,9 @@ pub async fn export_outbound(
     inventory.devices = devices.clone();
     inventory.collected_at = chrono::Utc::now();
 
-    let attestation = DriveAttestation {
-        drive_id: req.drive_id.clone(),
-        direction: Direction::Outbound,
-        session,
-    };
+    let cycle_token = DriveAttestation::generate_next_token();
+    let attestation = DriveAttestation::new(req.drive_id.clone(), Direction::Outbound, session)
+        .with_cycle_token(cycle_token);
     let bundle = OutboundBundle {
         attestation,
         inventory,
@@ -559,11 +575,16 @@ pub async fn export_outbound(
         });
     }
 
+    // Seal drive with signed integrity canary
+    if let Ok(canary) = IntegrityCanary::build(&mount, "devnet-server") {
+        let _ = canary.write_signed(&mount, &signing_key);
+    }
+
     st.audit.log(
         "dashboard",
         "export_outbound",
         &req.mount_point,
-        &format!("session {session} / {} devices", devices.len()),
+        &format!("session {session} / {} devices (canary sealed)", devices.len()),
     );
 
     Json(ExportResponse {
@@ -616,6 +637,31 @@ pub async fn verify_inbound(
         }
     };
 
+    let consumed_path = st.store_dir.join("consumed_tokens.json");
+    if let Err(e) = DriveAttestation::verify_rolling_token(&mount, &consumed_path) {
+        return Json(PushResponse {
+            ok: false,
+            error: Some(format!("Autolock check failed: {e}")),
+            updates: 0,
+        });
+    }
+
+    // Verify integrity canary; if tampered or unauthorized write detected, zeroize key envelope immediately
+    if let Err(e) = IntegrityCanary::verify(&mount, &release_key) {
+        let _ = zeroize_and_shred_envelope(&mount);
+        st.audit.log(
+            "dashboard",
+            "tamper_detected",
+            &req.mount_point,
+            &format!("shredded key envelope: {e}"),
+        );
+        return Json(PushResponse {
+            ok: false,
+            error: Some(format!("TAMPER DETECTED: {e}. Key envelope shredded.")),
+            updates: 0,
+        });
+    }
+
     let verdict = crate::devnet::SandboxVerdict {
         passed: true,
         reason: "admin re-verify".to_string(),
@@ -626,6 +672,18 @@ pub async fn verify_inbound(
         let mut devnet = st.devnet.write().await;
         devnet.ingest_verified_bundle(verdict)
     };
+
+    if result.is_ok() {
+        if let Ok(Some(tok)) = DriveAttestation::verify_rolling_token(&mount, &consumed_path) {
+            let _ = DriveAttestation::burn_token(&consumed_path, &tok);
+            st.audit.log(
+                "dashboard",
+                "autolock_burned",
+                &req.mount_point,
+                &format!("burned rolling token {}", &tok[..16.min(tok.len())]),
+            );
+        }
+    }
 
     match result {
         Ok(()) => {

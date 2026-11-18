@@ -12,6 +12,24 @@ pub enum DistroFamily {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DiskStorage {
+    pub mount_point: String,
+    pub filesystem: String,
+    pub total_bytes: u64,
+    pub available_bytes: u64,
+    pub used_bytes: u64,
+    pub used_percent: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NetworkInterface {
+    pub name: String,
+    pub ip_addresses: Vec<String>,
+    #[serde(default)]
+    pub mac_address: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct OsInventory {
     pub hostname: String,
     pub os_name: String,
@@ -23,6 +41,12 @@ pub struct OsInventory {
     pub bootloader: String,
     pub packages: Vec<Package>,
     pub repos: Vec<String>,
+    #[serde(default)]
+    pub disks: Vec<DiskStorage>,
+    #[serde(default)]
+    pub networks: Vec<NetworkInterface>,
+    #[serde(default)]
+    pub last_updated_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

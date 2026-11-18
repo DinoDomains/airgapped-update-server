@@ -2,7 +2,7 @@
 use std::path::Path;
 use std::collections::BTreeMap;
 
-use airgap_proto::{DistroFamily, OsInventory, Package};
+use airgap_proto::{DiskStorage, DistroFamily, NetworkInterface, OsInventory, Package};
 
 fn hostname() -> String {
     #[cfg(windows)]
@@ -283,6 +283,146 @@ fn collect_repos(family: &DistroFamily) -> Vec<String> {
     repos
 }
 
+fn collect_disks() -> Vec<DiskStorage> {
+    let mut disks = Vec::new();
+    #[cfg(not(windows))]
+    {
+        if let Ok(out) = std::process::Command::new("df").args(["-B1", "-P"]).output() {
+            if out.status.success() {
+                for line in String::from_utf8_lossy(&out.stdout).lines().skip(1) {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 6 {
+                        let fs = parts[0];
+                        // Skip virtual/pseudo filesystems
+                        if fs.starts_with("dev") || fs == "run" || fs == "none" || fs == "tmpfs" || fs == "efivarfs" {
+                            continue;
+                        }
+                        let total: u64 = parts[1].parse().unwrap_or(0);
+                        let used: u64 = parts[2].parse().unwrap_or(0);
+                        let avail: u64 = parts[3].parse().unwrap_or(0);
+                        let cap_str = parts[4].trim_end_matches('%');
+                        let used_percent: f32 = cap_str.parse().unwrap_or(0.0);
+                        let mount_point = parts[5].to_string();
+
+                        disks.push(DiskStorage {
+                            mount_point,
+                            filesystem: fs.to_string(),
+                            total_bytes: total,
+                            available_bytes: avail,
+                            used_bytes: used,
+                            used_percent,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    disks
+}
+
+fn collect_networks() -> Vec<NetworkInterface> {
+    let mut interfaces = Vec::new();
+    #[cfg(not(windows))]
+    {
+        if let Ok(out) = std::process::Command::new("ip").args(["-j", "addr"]).output() {
+            if out.status.success() {
+                if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
+                    if let Some(arr) = val.as_array() {
+                        for item in arr {
+                            let name = item["ifname"].as_str().unwrap_or("").to_string();
+                            if name.is_empty() || name == "lo" {
+                                continue;
+                            }
+                            let mac = item["address"].as_str().map(|s| s.to_string());
+                            let mut ips = Vec::new();
+                            if let Some(addrs) = item["addr_info"].as_array() {
+                                for a in addrs {
+                                    if let Some(local) = a["local"].as_str() {
+                                        ips.push(local.to_string());
+                                    }
+                                }
+                            }
+                            interfaces.push(NetworkInterface {
+                                name,
+                                ip_addresses: ips,
+                                mac_address: mac,
+                            });
+                        }
+                        if !interfaces.is_empty() {
+                            return interfaces;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback: parse regular `ip addr`
+        if let Ok(out) = std::process::Command::new("ip").arg("addr").output() {
+            let mut cur_name = String::new();
+            let mut cur_ips = Vec::new();
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                let line = line.trim();
+                if let Some(idx) = line.find(": ") {
+                    if !line.starts_with("inet") && line.chars().next().map_or(false, |c| c.is_ascii_digit()) {
+                        if !cur_name.is_empty() && cur_name != "lo" {
+                            interfaces.push(NetworkInterface {
+                                name: cur_name,
+                                ip_addresses: cur_ips,
+                                mac_address: None,
+                            });
+                            cur_ips = Vec::new();
+                        }
+                        let rest = &line[idx + 2..];
+                        cur_name = rest.split(':').next().unwrap_or("").trim().to_string();
+                    }
+                }
+                if line.starts_with("inet ") {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() > 1 {
+                        let ip = parts[1].split('/').next().unwrap_or("");
+                        if !ip.is_empty() && ip != "127.0.0.1" {
+                            cur_ips.push(ip.to_string());
+                        }
+                    }
+                }
+            }
+            if !cur_name.is_empty() && cur_name != "lo" {
+                interfaces.push(NetworkInterface {
+                    name: cur_name,
+                    ip_addresses: cur_ips,
+                    mac_address: None,
+                });
+            }
+        }
+    }
+    interfaces
+}
+
+fn detect_last_updated() -> Option<String> {
+    #[cfg(not(windows))]
+    {
+        use std::fs;
+        use chrono::{DateTime, Utc};
+
+        let paths = [
+            "/var/lib/dpkg/status",
+            "/var/lib/rpm/rpmdb.sqlite",
+            "/var/lib/rpm/Packages",
+            "/var/lib/pacman/local",
+        ];
+
+        for p in paths {
+            if let Ok(meta) = fs::metadata(p) {
+                if let Ok(modified) = meta.modified() {
+                    let dt: DateTime<Utc> = modified.into();
+                    return Some(dt.to_rfc3339());
+                }
+            }
+        }
+    }
+    None
+}
+
 pub async fn collect() -> OsInventory {
     let os = os_release();
     let os_name = os.get("NAME").cloned().unwrap_or_else(|| "unknown".to_string());
@@ -295,6 +435,9 @@ pub async fn collect() -> OsInventory {
     let family = detect_family(&os_name);
     let packages = collect_packages(&family);
     let repos = collect_repos(&family);
+    let disks = collect_disks();
+    let networks = collect_networks();
+    let last_updated_at = detect_last_updated();
 
     OsInventory {
         hostname: hostname(),
@@ -307,5 +450,8 @@ pub async fn collect() -> OsInventory {
         bootloader: bootloader(),
         packages,
         repos,
+        disks,
+        networks,
+        last_updated_at,
     }
 }

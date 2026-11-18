@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use airgap_contracts::{
-    Direction, DriveAttestation, InboundCatalog, InboundManifest, InstalledPackage, Release,
-    Revocation,
+    ContractError, Direction, DriveAttestation, InboundCatalog, InboundManifest, InstalledPackage,
+    IntegrityCanary, Release, Revocation, zeroize_and_shred_envelope,
 };
 use ed25519_dalek::{Signature, Signer, Verifier};
 use chrono::Utc;
@@ -154,11 +154,7 @@ async fn handoff_reverifies_independently() {
     let manifest = InboundManifest::build(1, &catalog, &drive_root.join("artifacts"))
         .expect("manifest build");
 
-    let attestation = DriveAttestation {
-        drive_id: "USB-IN-01".into(),
-        direction: Direction::Inbound,
-        session: 1,
-    };
+    let attestation = DriveAttestation::new("USB-IN-01", Direction::Inbound, 1);
 
     // Write attestation files
     std::fs::write(drive_root.join("drive_id.txt"), "USB-IN-01").unwrap();
@@ -193,6 +189,117 @@ async fn handoff_reverifies_independently() {
     );
     // Should fail because the artifact doesn't exist on disk.
     assert!(result.is_err());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn drill_unauthorized_write_anti_tamper_zeroization() {
+    let (sk, vk) = keypair();
+    let dir = std::env::temp_dir().join(format!("devnet-drill-zeroize-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // 1. Legitimate export sets up drive with key envelope and signed canary
+    std::fs::write(dir.join("drive_id.txt"), "USB-SECURE-001").unwrap();
+    std::fs::write(dir.join("key_envelope.bin"), b"AES_MASTER_KEY_SECRET_256_BITS").unwrap();
+    std::fs::write(dir.join("manifest.json"), b"{\"releases\":[]}").unwrap();
+
+    let canary = IntegrityCanary::build(&dir, "devnet-server").unwrap();
+    canary.write_signed(&dir, &sk).unwrap();
+
+    // Valid drive verifies successfully
+    assert!(IntegrityCanary::verify(&dir, &vk).is_ok());
+
+    // 2. Simulated Attack: An unauthorized host writes a rogue script to the USB
+    std::fs::write(dir.join("rogue_payload.sh"), b"#!/bin/sh\nrm -rf /").unwrap();
+
+    // 3. Canary detection trips
+    let tamper_res = IntegrityCanary::verify(&dir, &vk);
+    assert!(tamper_res.is_err());
+    assert!(matches!(tamper_res, Err(ContractError::TamperDetected(_))));
+
+    // 4. Trigger cryptographic shredder
+    zeroize_and_shred_envelope(&dir).unwrap();
+
+    // 5. Verify the key envelope is purged and lock marker is dropped
+    assert!(!dir.join("key_envelope.bin").exists());
+    assert!(dir.join("TAMPER_SELF_DESTRUCTED.txt").exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn drill_replay_autolock_consumed_token() {
+    let dir = std::env::temp_dir().join(format!("devnet-drill-autolock-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let consumed_path = dir.join("consumed_tokens.json");
+    let token = DriveAttestation::generate_next_token();
+
+    let att = DriveAttestation::new("USB-OUT-01", Direction::Outbound, 1)
+        .with_cycle_token(&token);
+    att.write(&dir).unwrap();
+
+    // First ingestion: token verified OK
+    let verified = DriveAttestation::verify_rolling_token(&dir, &consumed_path).unwrap();
+    assert_eq!(verified, Some(token.clone()));
+
+    // Ingestion succeeds -> token is burned
+    DriveAttestation::burn_token(&consumed_path, &token).unwrap();
+
+    // Attack drill: Replaying the identical USB bundle must fail closed
+    let replay_res = DriveAttestation::verify_rolling_token(&dir, &consumed_path);
+    assert!(replay_res.is_err());
+    let err_msg = replay_res.unwrap_err().to_string();
+    assert!(err_msg.contains("CYCLE REPLAY DETECTED"));
+    assert!(err_msg.contains("card autolock active"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn drill_path_traversal_and_badusb_injection() {
+    let (sk, vk) = keypair();
+    let dir = std::env::temp_dir().join(format!("devnet-drill-traversal-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Drive attestation
+    let att = DriveAttestation::new("USB-IN-01", Direction::Inbound, 1);
+    att.write(&dir).unwrap();
+
+    let catalog = InboundCatalog {
+        schema_version: airgap_contracts::SCHEMA_VERSION,
+        session: 1,
+        releases: vec![],
+        revocations: vec![],
+    };
+    let cat_bytes = catalog.to_canonical_bytes().unwrap();
+    let cat_sha256 = airgap_contracts::sha256_bytes(&cat_bytes);
+    std::fs::write(dir.join("catalog.json"), &cat_bytes).unwrap();
+
+    // Injected malicious manifest with path traversal
+    let manifest = airgap_contracts::InboundManifest {
+        schema_version: airgap_contracts::SCHEMA_VERSION,
+        session: 1,
+        catalog_sha256: cat_sha256,
+        artifacts: vec![airgap_contracts::ArtifactEntry {
+            path: "artifacts/../../../../etc/shadow".into(),
+            sha256: "deadbeef".into(),
+            size: 100,
+        }],
+    };
+    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+    let sig = airgap_contracts::ed25519_sign(&sk, &manifest_bytes);
+    std::fs::write(dir.join("manifest.json"), &manifest_bytes).unwrap();
+    std::fs::write(dir.join("manifest.sig"), sig).unwrap();
+
+    // InboundBundle read_and_verify must fail closed with PathTraversal
+    let read_res = airgap_contracts::InboundBundle::read_and_verify(&dir, "USB-IN-01", 0, &vk);
+    assert!(read_res.is_err());
+    assert!(matches!(read_res, Err(ContractError::PathTraversal(_))));
 
     let _ = std::fs::remove_dir_all(&dir);
 }
